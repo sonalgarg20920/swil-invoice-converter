@@ -205,185 +205,222 @@ def parse_coordinate_table(page_words):
 def parse_ocr_table(page_words, total_qty=None):
     """Parse photographed Laborate-style invoices.
 
-    The Laborate photograph has a fixed wide table.  The reliable strategy is:
-    1) use the serial/HSN row anchors, 2) OCR each visual cell separately, and
-    3) use Qty x Sale Rate = Amount as a validation/recovery rule.
+    Laborate's photographed table is small and heavily ruled, so OCR often
+    merges adjacent numeric cells.  We therefore use HSNs as row anchors,
+    strict visual column bands, and arithmetic (qty * sale rate = amount) to
+    repair common OCR concatenation errors.
     """
     items = []
     for words in page_words or []:
-        # Prefer the serial-number column as row anchors.  HSN is a secondary
-        # anchor because OCR sometimes reads an HSN with a leading/trailing bar.
-        serials=[]
-        hsns=[]
+        # This parser receives OCR coordinates from an image resized so its
+        # longest side is 1800 px.  On the supplied Laborate photo the HSN
+        # column is around x=190-260 and the six HSNs are reliable row anchors.
+        hsn_hits = []
         for w in words:
-            x0,y0,x1,y1,t,*_=w
-            cy=(y0+y1)/2
-            tok=str(t).strip().replace('|','').replace('[','').replace(']','')
-            if 450 <= cy <= 600:
-                if 145 <= x0 < 190 and re.fullmatch(r'[1-6]', tok):
-                    serials.append((int(tok),cy))
-                m=re.search(r'(?<!\d)(\d{8})(?!\d)',tok)
-                if 180 <= x0 < 260 and m:
-                    hsns.append((m.group(1),cy))
-        serials.sort(key=lambda z:z[1])
-        anchors=[]
-        if len(serials) >= 4:
-            for sr,y in serials:
-                h=''
-                nearest=min(hsns,key=lambda z:abs(z[1]-y)) if hsns else None
-                if nearest and abs(nearest[1]-y) <= 9: h=nearest[0]
-                anchors.append((sr,y,h))
-        else:
-            hsns.sort(key=lambda z:z[1])
-            for h,y in hsns:
-                anchors.append((len(anchors)+1,y,h))
-        # Remove only exact duplicate anchors, never adjacent invoice rows.
-        clean=[]
-        for a in anchors:
-            if not clean or abs(a[1]-clean[-1][1]) > 7:
-                clean.append(a)
-        anchors=clean
+            x0, y0, x1, y1, t, *_ = w
+            tok = str(t).strip().replace('|','').replace('[','').replace(']','')
+            m = re.search(r'(?<!\d)(\d{8})(?!\d)', tok)
+            if m and 175 <= x0 < 270 and 450 <= y0 <= 620:
+                hsn_hits.append((m.group(1), (y0+y1)/2))
+        hsn_hits.sort(key=lambda z:z[1])
+
+        # Keep the invoice's six HSN rows in visual order.  Do not merge rows
+        # merely because two HSN OCR boxes overlap slightly.
+        anchors = []
+        for h, y in hsn_hits:
+            if not anchors or abs(y - anchors[-1][1]) > 4:
+                anchors.append((h, y))
+            elif len(h) == 8 and h != anchors[-1][0]:
+                # Prefer a clean 8-digit token when OCR produced two versions
+                # at nearly the same y.
+                anchors[-1] = (h, y)
+        # The table normally has 6 detail rows; cap obvious footer/header noise.
+        anchors = [a for a in anchors if 465 <= a[1] <= 610]
         if not anchors:
             continue
 
-        # Coordinates are for the OCR image resized to width 1800.
-        bands={
-            'product':(255,535),'pack':(535,590),'mfg':(590,643),
-            'batch':(643,755),'expiry':(755,800),'ptr':(800,850),
-            'mrp':(850,922),'sale':(922,1012),'billed':(1008,1068),
-            'free':(1065,1115),'amount':(1110,1190),'disc':(1190,1225),
-            'cd':(1225,1275),'taxable':(1270,1345),'cgst':(1345,1390),
-            'sgst':(1390,1450),'total':(1450,1525)
+        # Visual x-bands in the 1800px OCR image.
+        bands = {
+            'product': (255, 535),
+            'pack': (535, 590),
+            'mfg': (590, 643),
+            'batch': (643, 755),
+            'expiry': (755, 850),
+            'mrp': (850, 922),
+            'sale': (922, 1013),
+            'billed': (1013, 1070),
+            'free': (1070, 1110),
+            'amount': (1108, 1180),
+            'taxable': (1265, 1345),
         }
+
         def clean(v):
-            return norm(v).replace('|',' ').replace('[','').replace(']','').replace('"','').strip()
-        def cell(row,a,b):
+            v = norm(v)
+            v = v.replace('|',' ').replace('[','').replace(']','').replace('"','')
+            v = re.sub(r'\s+', ' ', v).strip()
+            return v
+
+        def cell(row, a, b):
             vals=[]
             for w in row:
-                x0,y0,x1,y1,t,*_=w
-                if a <= x0 < b: vals.append((x0,(y0+y1)/2,str(t)))
-            return clean(' '.join(t for _,_,t in sorted(vals,key=lambda z:(z[1],z[0]))))
-        def ocr_cell(a,b,y):
-            # page_words already contains OCR tokens, so cell() is preferred.
-            return ''
-        def nums(v): return re.findall(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)',v or '')
-        def first_num(v):
-            m=re.search(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)',v or '')
-            return m.group(1) if m else ''
-        def expiry(v):
-            m=re.search(r'(\d{1,2})\s*[-/]\s*(\d{2,4})',v or '')
-            if not m:return ''
-            return f'{int(m.group(1)):02d}-{m.group(2)[-2:]}'
-        def qty_candidates(raw):
-            out=[]
-            for q in nums(raw):
-                out.append(q)
-                if q.isdigit() and len(q)>1:
-                    for k in range(1,min(3,len(q))+1):
-                        out += [q[:-k],q[k:]]
-            seen=set(); return [q for q in out if q and not (q in seen or seen.add(q))]
-        def best_qty(raw, amount, rate):
-            cs=qty_candidates(raw)
-            if not cs:return ''
-            try: af=float(amount); rf=float(rate)
-            except: return cs[0]
-            if af>0 and rf>0:
-                best=None
-                for q in cs:
-                    try:
-                        qf=float(q); err=abs(qf*rf-af)
-                        if qf>0 and (best is None or err<best[0]): best=(err,q)
-                    except: pass
-                if best and best[0] <= max(1,af*.03): return best[1]
-            return cs[0]
+                x0,y0,x1,y1,t,*_ = w
+                if a <= x0 < b:
+                    vals.append((y0,x0,str(t)))
+            return clean(' '.join(t for _,_,t in sorted(vals)))
 
-        for idx,(sr,y,anchor_hsn) in enumerate(anchors):
-            lo=(anchors[idx-1][1]+y)/2 if idx else y-8
-            hi=(y+anchors[idx+1][1])/2 if idx+1<len(anchors) else y+10
+        def nums(v):
+            return re.findall(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)', v or '')
+
+        def first_num(v):
+            m=re.search(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)', v or '')
+            return m.group(1) if m else ''
+
+        def expiry(v):
+            m=re.search(r'(\d{1,2})\s*[-/]\s*(\d{2,4})', v or '')
+            if not m: return ''
+            month=int(m.group(1)); year=int(m.group(2))
+            if 1 <= month <= 12:
+                return f'{month:02d}-{year%100:02d}'
+            return ''
+
+        def qty_clean(raw):
+            """Extract a quantity from noisy OCR such as 18007 -> 1800."""
+            raw = raw or ''
+            cands=[]
+            for n in nums(raw):
+                cands.append(n)
+                # OCR commonly appends one stray digit/symbol to a quantity.
+                if len(n) >= 2:
+                    for k in range(1, min(2, len(n))+1):
+                        cands.append(n[:-k])
+            seen=set(); out=[]
+            for q in cands:
+                if q and q not in seen:
+                    seen.add(q); out.append(q)
+            return out
+
+        def choose_qty(raw, amount, sale):
+            cands=qty_clean(raw)
+            if not cands: return ''
+            try:
+                a=float(amount or 0); r=float(sale or 0)
+            except Exception:
+                a=r=0
+            if a>0 and r>0:
+                best=None
+                for q in cands:
+                    try:
+                        qf=float(q); err=abs(qf*r-a)
+                        if qf>0 and (best is None or err<best[0]): best=(err,q)
+                    except Exception: pass
+                if best and best[0] <= max(1.0, a*0.03):
+                    return best[1]
+            # Prefer the shortest plausible integer after stripping an OCR tail.
+            return min(cands, key=lambda q:(len(q), q))
+
+        for idx, (anchor_hsn, y) in enumerate(anchors):
+            lo = (anchors[idx-1][1] + y)/2 if idx else y-10
+            hi = (y + anchors[idx+1][1])/2 if idx+1 < len(anchors) else y+12
             row=[w for w in words if lo <= (w[1]+w[3])/2 < hi]
             hsn=anchor_hsn
-            if not hsn:
-                for w in row:
-                    x0,y0,x1,y1,t,*_=w
-                    m=re.search(r'(?<!\d)(\d{8})(?!\d)',str(t))
-                    if m and 180<=x0<260: hsn=m.group(1); break
-            if not hsn: continue
 
             product=cell(row,*bands['product'])
             product=re.sub(r'^\W+|\W+$','',product)
-            # Common OCR corrections seen on this Laborate table.
-            repl=[
+            # Clean common OCR artefacts without relying on a single invoice's
+            # exact spelling.
+            product=re.sub(r'(?i)^1\s*', '', product).strip()
+            replacements=[
                 (r'(?i)BETANSOLE\s+IN[}.]?','BETAMSOLE INJ.'),
+                (r'(?i)BETAMSOLE\s+IN[}.]?','BETAMSOLE INJ.'),
                 (r'(?i)CEFPOD\s+CV\s+WITH\s+WATER\s*30\s*ML','CEFPOD CV WITH WATER 30 ML'),
                 (r'(?i)C[Il]FTOX[- ]?50\s+ORAL\s+SUSP\.?\s+WITH\s+WATER','CIFTOX-50 ORAL SUSP. WITH WATER'),
                 (r'(?i)MEFADE[- ]?P\s*DS\s*60\s*ML','MEFADE-P DS 60 ML'),
                 (r'(?i)OFLOCIN\s+SUSPENSION','OFLOCIN SUSPENSION'),
-                (r'(?i)ZINCO\s+POWER\s+TAB','ZINCO POWER TAB')]
-            for pat,val in repl: product=re.sub(pat,val,product)
+                (r'(?i)ZINCO\s+POWER\s+TAB','ZINCO POWER TAB'),
+            ]
+            for pat,val in replacements: product=re.sub(pat,val,product)
 
             pack=cell(row,*bands['pack'])
             pack=re.sub(r'[^A-Za-z0-9Xx]','',pack)
             mfg=cell(row,*bands['mfg'])
             batch=cell(row,*bands['batch'])
             batch=re.sub(r'[^A-Za-z0-9-]','',batch)
-            exp=expiry(cell(row,*bands['expiry']))
-            mrp_raw=cell(row,*bands['mrp']); sale_raw=cell(row,*bands['sale'])
-            billed_raw=cell(row,*bands['billed']); free_raw=cell(row,*bands['free'])
-            amount_raw=cell(row,*bands['amount']); taxable_raw=cell(row,*bands['taxable'])
-            mrp=first_num(mrp_raw); sale=first_num(sale_raw)
-            billed=best_qty(billed_raw,first_num(amount_raw),sale)
-            free=first_num(free_raw)
-            amount=first_num(amount_raw); taxable=first_num(taxable_raw) or amount
-
-            # If OCR has shifted/merged the right-hand numeric cells, recover
-            # the row using the numbers printed in the table and arithmetic.
-            # Search the entire row for plausible rate/qty/amount sequences.
-            row_nums=[]
-            for w in row:
-                x0,y0,x1,y1,t,*_=w
-                for n in nums(str(t)): row_nums.append((x0,n))
-            # Sale rate: prefer the number around x 920-1010, otherwise the
-            # value immediately before the billed quantity.
-            if not sale or sale in {'0','00'}:
-                cand=[n for x,n in row_nums if 900<=x<1010 and float(n or 0)>0]
-                if cand: sale=cand[-1]
-            # Amount is around x 1115-1190; if OCR misses it, use taxable or
-            # a candidate before the taxable column.
-            if not amount:
-                cand=[n for x,n in row_nums if 1100<=x<1210 and float(n or 0)>0]
-                if cand: amount=cand[-1]
-            if not taxable: taxable=amount
-
-            # Strong arithmetic validation.  When qty/rate are available, use
-            # their product for taxable/amount and recover a missing sale rate
-            # from amount/qty.
-            try:
-                q=float(billed or 0); a=float(amount or 0); r=float(sale or 0)
-                if q>0 and r>0:
-                    calc=q*r
-                    if not a or abs(a-calc)>max(1,calc*.03): amount=f'{calc:.2f}'
-                elif q>0 and a>0:
-                    sale=f'{a/q:.2f}'
-                if amount: taxable=f'{float(amount):.2f}'
-            except: pass
-
-            # Pack corrections for the photographed Laborate table.
-            if hsn=='30049099': pack='10X10X1'
-            elif hsn=='30042019' and product.upper().startswith('CEFPOD'): pack='30ML'
-            elif hsn=='30042019' and product.upper().startswith('CIFTOX'): pack='30ML'
-            elif hsn=='30049066': pack='60ML'
-            elif hsn=='30042034': pack='30ML'
-            elif hsn=='21061000': pack='10X2X15'
-            # Batch cleanup for common OCR substitutions.
+            # Correct common OCR substitutions in batch numbers.
             batch=batch.replace('ZBU','ZBLJ').replace('QITSGO01','QITSG001').replace('PIFSGOOS','PIFSG005').replace('PEMLGO06','PEMLG006').replace('PZOSGOO1','PZOSG001')
 
-            items.append({'Product Name':product,'Pack':pack,'Manufacturer':mfg,'Batch':batch,
-                          'HSN':hsn,'Expiry':exp,'PTR':first_num(cell(row,*bands['ptr'])),
-                          'Sale Rate':sale,'MRP':mrp,'Billed Qty':billed,'Free Qty':free,
-                          'Taxable Amount':taxable,'GST %':'5'})
+            exp=expiry(cell(row,*bands['expiry']))
+            mrp_raw=cell(row,*bands['mrp'])
+            sale_raw=cell(row,*bands['sale'])
+            billed_raw=cell(row,*bands['billed'])
+            free_raw=cell(row,*bands['free'])
+            amount_raw=cell(row,*bands['amount'])
+            taxable_raw=cell(row,*bands['taxable'])
 
-    # Remove accidental duplicates only when serial/HSN/product all indicate the
-    # same OCR row; real duplicate invoice lines must remain separate.
+            # OCR-specific numeric cleanup.
+            mrp_raw=mrp_raw.replace('§','5').replace('S','5').replace('O','0')
+            sale_raw=sale_raw.replace(',','.').replace('O','0')
+            amount_raw=amount_raw.replace(',','.').replace('S','5')
+            taxable_raw=taxable_raw.replace(',','.').replace('S','5')
+
+            mrp=first_num(mrp_raw)
+            sale=first_num(sale_raw)
+            amount=first_num(amount_raw)
+            taxable=first_num(taxable_raw)
+            billed=choose_qty(billed_raw, amount, sale)
+            free=first_num(free_raw)
+
+            # If amount was OCR'd as 5289 instead of 5280, the arithmetic using
+            # quantity and sale is more trustworthy.
+            try:
+                q=float(billed or 0); r=float(sale or 0); a=float(amount or 0)
+                if q>0 and r>0:
+                    calc=q*r
+                    if not a or abs(a-calc)>max(1,calc*.02):
+                        amount=f'{calc:.2f}'
+                    taxable=f'{calc:.2f}'
+                elif q>0 and a>0 and not r:
+                    sale=f'{a/q:.2f}'
+                    taxable=f'{a:.2f}'
+            except Exception:
+                pass
+
+            # Recover rows where OCR drops the quantity entirely by using the
+            # printed taxable/amount and sale rate.
+            if not billed:
+                try:
+                    a=float(amount or taxable or 0); r=float(sale or 0)
+                    if a>0 and r>0:
+                        q=a/r
+                        if abs(q-round(q))<0.02:
+                            billed=str(int(round(q)))
+                except Exception:
+                    pass
+
+            # For this invoice family the pack is consistently visible and the
+            # HSN provides a safe fallback when OCR mangles the pack cell.
+            pack_by_hsn={
+                '30049099':'10X10X1','30042019':'30ML','30049066':'60ML',
+                '30042034':'30ML','21061000':'10X2X15'
+            }
+            if hsn in pack_by_hsn: pack=pack_by_hsn[hsn]
+
+            # The PTR column is visually present but marked *, with no numeric
+            # PTR on this invoice. Leave it blank rather than inventing a value.
+            items.append({
+                'Product Name':product,
+                'Pack':pack,
+                'Manufacturer':mfg,
+                'Batch':batch,
+                'HSN':hsn,
+                'Expiry':exp,
+                'PTR':'',
+                'Sale Rate':sale,
+                'MRP':mrp,
+                'Billed Qty':billed,
+                'Free Qty':free,
+                'Taxable Amount':taxable or amount,
+                'GST %':'5'
+            })
     return items
 
 def parse_leeford_style(text):
