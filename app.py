@@ -209,7 +209,8 @@ def parse_ocr_table(page_words):
         hsn_anchors = []
         for w in words:
             x0, y0, x1, y1, t, *_ = w
-            m = re.search(r"\\d{8}", str(t))
+            token = str(t).strip().upper().replace("O", "0").replace("I", "1").replace("L", "1")
+            m = re.search(r"\d{8}", token)
             if m:
                 hsn_anchors.append((m.group(), (y0 + y1) / 2))
         # unique anchors by y, preserving order
@@ -245,7 +246,7 @@ def parse_ocr_table(page_words):
             for w in row:
                 if 1000 <= w[0] < 1220:
                     q=re.sub(r"[^0-9.]","",str(w[4]))
-                    if q and re.fullmatch(r"\\d+(?:\\.\\d+)?",q): nums.append((w[0],q))
+                    if q and re.fullmatch(r"\d+(?:\.\d+)?",q): nums.append((w[0],q))
             if not billed or not re.search(r"\\d", billed):
                 near=[q for x,q in nums if x < 1128]
                 billed=near[0] if near else ""
@@ -317,9 +318,11 @@ def parse_leeford_style(text):
 
 def parse_invoice(text, page_words=None):
     invoice_no = first_match(r"Bill\s+No\.?\s*:\s*([^\n]+)", text)
-    date = first_match(r"\bDATE\s*\n?\s*(\d{2}-\d{2}-\d{4})", text)
+    date = first_match(r"(?:\bDATE|Date)\s*[:\-]?\s*(\d{2}[-/]\d{2}[-/]\d{4})", text)
     if not date:
-        date = first_match(r"Invoice\s+Date\s+(\d{2}-\d{2}-\d{4})", text)
+        date = first_match(r"Invoice\s+Date\s*[:\-]?\s*(\d{2}[-/]\d{2}[-/]\d{4})", text)
+    if not date:
+        date = first_match(r"\b(\d{2}[-/]\d{2}[-/]\d{4})\b", text)
     supplier_gstin = first_match(r"GST\s+(?:No\.?|IN)\s*:\s*([0-9A-Z]{15})", text)
     eway = first_match(r"E\.Way\s+Bill\s*\n?\s*No\.\s*&\s*Date\s*\n?\s*([0-9]+)", text)
 
