@@ -1,4 +1,5 @@
 import io, re, csv
+import shutil
 from pathlib import Path
 import pandas as pd
 import streamlit as st
@@ -25,12 +26,20 @@ def extract_document(uploaded_file):
         except Exception as e:
             raise RuntimeError(f"Could not read PDF: {e}")
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
         import pytesseract
-        img = Image.open(io.BytesIO(data))
-        return pytesseract.image_to_string(img), None
+        if not shutil.which("tesseract"):
+            raise RuntimeError("Tesseract OCR engine is not installed on this server. Add packages.txt with tesseract-ocr and redeploy.")
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        # Light preprocessing improves OCR on photographed/low-contrast invoices.
+        gray = ImageOps.grayscale(img)
+        if max(gray.size) < 1800:
+            scale = 1800 / max(gray.size)
+            gray = gray.resize((int(gray.width * scale), int(gray.height * scale)))
+        text = pytesseract.image_to_string(gray, config="--psm 6")
+        return text, None
     except Exception as e:
-        raise RuntimeError("Could not OCR the image. Install Tesseract OCR and the Python packages from requirements.txt.") from e
+        raise RuntimeError(f"Could not OCR the image: {e}") from e
 
 
 def norm(s):
