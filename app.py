@@ -30,14 +30,47 @@ def extract_document(uploaded_file):
         import pytesseract
         if not shutil.which("tesseract"):
             raise RuntimeError("Tesseract OCR engine is not installed on this server. Add packages.txt with tesseract-ocr and redeploy.")
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-        # Light preprocessing improves OCR on photographed/low-contrast invoices.
-        gray = ImageOps.grayscale(img)
-        if max(gray.size) < 1800:
-            scale = 1800 / max(gray.size)
-            gray = gray.resize((int(gray.width * scale), int(gray.height * scale)))
-        text = pytesseract.image_to_string(gray, config="--psm 6")
-        return text, None
+        img = Image.open(io.BytesIO(data))
+        try:
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            pass
+        img = img.convert("RGB")
+
+        def prep(im):
+            gray = ImageOps.grayscale(im)
+            if max(gray.size) < 1800:
+                scale = 1800 / max(gray.size)
+                gray = gray.resize((int(gray.width * scale), int(gray.height * scale)))
+            return gray
+
+        candidates = []
+        for angle in (0, 90, 180, 270):
+            rotated = img.rotate(angle, expand=True)
+            gray = prep(rotated)
+            txt = pytesseract.image_to_string(gray, config="--psm 4")
+            upper = txt.upper()
+            score = sum(10 for kw in (
+                "TAX INVOICE", "BILL NO", "PRODUCT NAME", "QUANTITY",
+                "MRP", "TOTAL", "GST", "LABORATE", "AHUJA"
+            ) if kw in upper)
+            score += min(len(re.findall(r"\b\d{8}\b", txt)), 12) * 2
+            score += min(len(txt), 3000) / 3000
+            candidates.append((score, angle, txt))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        _, angle, text = candidates[0]
+        rotated = prep(img.rotate(angle, expand=True))
+        data_dict = pytesseract.image_to_data(rotated, config="--psm 4", output_type=pytesseract.Output.DICT)
+        words = []
+        for i, t in enumerate(data_dict["text"]):
+            t = str(t).strip()
+            if not t:
+                continue
+            x, y = data_dict["left"][i], data_dict["top"][i]
+            w, h = data_dict["width"][i], data_dict["height"][i]
+            words.append((x, y, x + w, y + h, t, 0, 0, 0))
+        return text, [words]
     except Exception as e:
         raise RuntimeError(f"Could not OCR the image: {e}") from e
 
@@ -164,6 +197,72 @@ def parse_coordinate_table(page_words):
     return items
 
 
+def parse_ocr_table(page_words):
+    """Parse photographed invoice tables from Tesseract word coordinates.
+
+    Uses 8-digit HSN values as row anchors, which is more reliable than OCR's
+    serial-number recognition on photographed invoices. The common Laborate
+    layout is supported with proportional column bands.
+    """
+    items = []
+    for words in page_words or []:
+        hsn_anchors = []
+        for w in words:
+            x0, y0, x1, y1, t, *_ = w
+            m = re.search(r"\\d{8}", str(t))
+            if m:
+                hsn_anchors.append((m.group(), (y0 + y1) / 2))
+        # unique anchors by y, preserving order
+        seen = set(); anchors=[]
+        for hsn,y in sorted(hsn_anchors, key=lambda z:z[1]):
+            key=(hsn, round(y/3))
+            if key not in seen and y > 350:
+                seen.add(key); anchors.append((hsn,y))
+        if not anchors:
+            continue
+        for i,(hsn,y) in enumerate(anchors):
+            lo = (anchors[i-1][1]+y)/2 if i else y-12
+            hi = (y+anchors[i+1][1])/2 if i+1<len(anchors) else y+18
+            row=[w for w in words if lo <= (w[1]+w[3])/2 < hi]
+            # This invoice layout is ~1800 px wide after normalization.
+            def field(a,b):
+                vals=[str(w[4]) for w in row if a <= w[0] < b]
+                return norm(" ".join(vals).replace("|"," "))
+            product=field(250,530)
+            pack=field(530,590)
+            mfg=field(590,642)
+            batch=field(642,750)
+            expiry=field(750,842)
+            ptr=field(842,925)
+            mrp=field(925,1005)
+            # On Laborate invoices the quantity section follows Sale Rate.
+            sale=field(1005,1070)
+            billed=field(1070,1125)
+            free=field(1125,1190)
+            # If OCR shifts the quantity values left/right, recover numeric values
+            # from the row's right-side sequence after the price fields.
+            nums=[]
+            for w in row:
+                if 1000 <= w[0] < 1220:
+                    q=re.sub(r"[^0-9.]","",str(w[4]))
+                    if q and re.fullmatch(r"\\d+(?:\\.\\d+)?",q): nums.append((w[0],q))
+            if not billed or not re.search(r"\\d", billed):
+                near=[q for x,q in nums if x < 1128]
+                billed=near[0] if near else ""
+            if not free or not re.search(r"\\d", free):
+                near=[q for x,q in nums if x >= 1128]
+                free=near[0] if near else "0"
+            if not product:
+                continue
+            items.append({
+                "Product Name": product, "Pack": pack, "Manufacturer": mfg,
+                "Batch": batch, "HSN": hsn, "Expiry": expiry, "PTR": ptr,
+                "Sale Rate": sale, "MRP": mrp, "Billed Qty": billed,
+                "Free Qty": free or "0", "Taxable Amount": "", "GST %": "5"
+            })
+    return items
+
+
 def parse_leeford_style(text):
     """Fallback parser for the original Leeford-style invoices."""
     lines = [x.strip() for x in text.splitlines() if x.strip()]
@@ -230,6 +329,8 @@ def parse_invoice(text, page_words=None):
         items = parse_coordinate_table(page_words)
     else:
         items = []
+    if not items and page_words:
+        items = parse_ocr_table(page_words)
     if not items:
         items = parse_leeford_style(text)
 
