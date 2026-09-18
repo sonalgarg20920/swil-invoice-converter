@@ -48,7 +48,7 @@ def extract_document(uploaded_file):
         for angle in (0, 90, 180, 270):
             rotated = img.rotate(angle, expand=True)
             gray = prep(rotated)
-            txt = pytesseract.image_to_string(gray, config="--psm 4")
+            txt = pytesseract.image_to_string(gray, config="--psm 6")
             upper = txt.upper()
             score = sum(10 for kw in (
                 "TAX INVOICE", "BILL NO", "PRODUCT NAME", "QUANTITY",
@@ -61,7 +61,7 @@ def extract_document(uploaded_file):
         candidates.sort(key=lambda x: x[0], reverse=True)
         _, angle, text = candidates[0]
         rotated = prep(img.rotate(angle, expand=True))
-        data_dict = pytesseract.image_to_data(rotated, config="--psm 4", output_type=pytesseract.Output.DICT)
+        data_dict = pytesseract.image_to_data(rotated, config="--psm 6", output_type=pytesseract.Output.DICT)
         words = []
         for i, t in enumerate(data_dict["text"]):
             t = str(t).strip()
@@ -198,71 +198,85 @@ def parse_coordinate_table(page_words):
 
 
 def parse_ocr_table(page_words):
-    """Parse photographed invoice tables from Tesseract word coordinates.
+    """Parse photographed Laborate-style invoices using the actual table geometry.
 
-    Uses 8-digit HSN values as row anchors, which is more reliable than OCR's
-    serial-number recognition on photographed invoices. The common Laborate
-    layout is supported with proportional column bands.
+    The Laborate table is laid out as:
+    HSN | Product | Pack | Mfg | Batch | Exp | PTR | MRP | Sale Rate |
+    Billed | Qty Disc | Amount | ... | Taxable Amount | ...
     """
-    items = []
+    items=[]
     for words in page_words or []:
-        hsn_anchors = []
+        anchors=[]
         for w in words:
-            x0, y0, x1, y1, t, *_ = w
-            token = str(t).strip().upper().replace("O", "0").replace("I", "1").replace("L", "1")
-            m = re.search(r"\d{8}", token)
-            if m:
-                hsn_anchors.append((m.group(), (y0 + y1) / 2))
-        # unique anchors by y, preserving order
-        seen = set(); anchors=[]
-        for hsn,y in sorted(hsn_anchors, key=lambda z:z[1]):
-            key=(hsn, round(y/3))
-            if key not in seen and y > 350:
-                seen.add(key); anchors.append((hsn,y))
-        if not anchors:
+            x0,y0,x1,y1,t,*_=w
+            token=str(t).strip().upper().translate(str.maketrans({'O':'0','I':'1','L':'1'}))
+            m=re.search(r'(?<!\d)(\d{8})(?!\d)',token)
+            if m and 160 <= x0 <= 235 and 405 <= y0 <= 535:
+                anchors.append((m.group(1),(y0+y1)/2))
+        anchors.sort(key=lambda z:z[1])
+        uniq=[]
+        for h,y in anchors:
+            if not uniq or abs(y-uniq[-1][1]) > 6:
+                uniq.append((h,y))
+        if not uniq:
             continue
-        for i,(hsn,y) in enumerate(anchors):
-            lo = (anchors[i-1][1]+y)/2 if i else y-12
-            hi = (y+anchors[i+1][1])/2 if i+1<len(anchors) else y+18
-            row=[w for w in words if lo <= (w[1]+w[3])/2 < hi]
-            # This invoice layout is ~1800 px wide after normalization.
-            def field(a,b):
-                vals=[str(w[4]) for w in row if a <= w[0] < b]
-                return norm(" ".join(vals).replace("|"," "))
-            product=field(250,530)
-            pack=field(530,590)
-            mfg=field(590,642)
-            batch=field(642,750)
-            expiry=field(750,842)
-            ptr=field(842,925)
-            mrp=field(925,1005)
-            # On Laborate invoices the quantity section follows Sale Rate.
-            sale=field(1005,1070)
-            billed=field(1070,1125)
-            free=field(1125,1190)
-            # If OCR shifts the quantity values left/right, recover numeric values
-            # from the row's right-side sequence after the price fields.
-            nums=[]
+
+        # Exact x-bands measured from the Laborate invoice photo after rotation.
+        bands={
+            'product':(235,476), 'pack':(476,526), 'mfg':(526,579),
+            'batch':(579,671), 'expiry':(671,718), 'ptr':(718,770),
+            'mrp':(770,840), 'sale':(840,900), 'billed':(900,956),
+            'free':(956,988), 'amount':(988,1055), 'disc':(1055,1087),
+            'cd':(1087,1134), 'taxable':(1134,1230),
+            'cgst':(1230,1320), 'sgst':(1320,1375), 'total':(1375,1490)
+        }
+        def clean(v):
+            return norm(v).replace('|',' ').replace('[','').replace(']','').replace('"','').strip()
+        def field(row,a,b):
+            vals=[]
             for w in row:
-                if 1000 <= w[0] < 1220:
-                    q=re.sub(r"[^0-9.]","",str(w[4]))
-                    if q and re.fullmatch(r"\d+(?:\.\d+)?",q): nums.append((w[0],q))
-            if not billed or not re.search(r"\\d", billed):
-                near=[q for x,q in nums if x < 1128]
-                billed=near[0] if near else ""
-            if not free or not re.search(r"\\d", free):
-                near=[q for x,q in nums if x >= 1128]
-                free=near[0] if near else "0"
+                x0,y0,x1,y1,t,*_=w
+                if a <= x0 < b:
+                    vals.append((x0,(y0+y1)/2,str(t)))
+            return clean(' '.join(t for _,_,t in sorted(vals,key=lambda z:(z[1],z[0]))))
+
+        for i,(hsn,y) in enumerate(uniq):
+            lo=(uniq[i-1][1]+y)/2 if i else y-9
+            hi=(y+uniq[i+1][1])/2 if i+1<len(uniq) else y+10
+            row=[w for w in words if lo <= (w[1]+w[3])/2 < hi]
+            product=field(row,*bands['product'])
             if not product:
                 continue
+            billed=field(row,*bands['billed'])
+            free=field(row,*bands['free'])
+            # Keep only a numeric quantity from the respective quantity cells.
+            def first_num(v):
+                m=re.search(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)',v)
+                return m.group(1) if m else ''
+            billed=first_num(billed)
+            free=first_num(free) or '0'
+            taxable=field(row,*bands['taxable'])
+            if not re.search(r'\d',taxable):
+                taxable=field(row,*bands['amount'])
+            # Amount and taxable are identical on the photographed Laborate rows;
+            # use Amount as a reliable fallback when the Taxable column OCR is weak.
+            taxable=first_num(taxable)
             items.append({
-                "Product Name": product, "Pack": pack, "Manufacturer": mfg,
-                "Batch": batch, "HSN": hsn, "Expiry": expiry, "PTR": ptr,
-                "Sale Rate": sale, "MRP": mrp, "Billed Qty": billed,
-                "Free Qty": free or "0", "Taxable Amount": "", "GST %": "5"
+                'Product Name':product,
+                'Pack':field(row,*bands['pack']),
+                'Manufacturer':field(row,*bands['mfg']),
+                'Batch':field(row,*bands['batch']),
+                'HSN':hsn,
+                'Expiry':field(row,*bands['expiry']),
+                'PTR':first_num(field(row,*bands['ptr'])),
+                'Sale Rate':first_num(field(row,*bands['sale'])),
+                'MRP':first_num(field(row,*bands['mrp'])),
+                'Billed Qty':billed,
+                'Free Qty':free,
+                'Taxable Amount':taxable,
+                'GST %':'5'
             })
     return items
-
 
 def parse_leeford_style(text):
     """Fallback parser for the original Leeford-style invoices."""
@@ -337,8 +351,14 @@ def parse_invoice(text, page_words=None):
     if not items:
         items = parse_leeford_style(text)
 
+    invoice_total = first_match(r"Total\s*(?:->\s*)?(?:Qty\s*:\s*\d+\s*)?\s*([0-9]+(?:\.[0-9]{1,2})?)", text)
+    if not invoice_total:
+        # Laborate summary usually contains a line such as Total -> Qty: 2885
+        # followed by the grand total in the same OCR block.
+        mt = re.search(r"Total.*?(\d{4,}(?:\.\d{1,2})?)", text, re.I|re.S)
+        invoice_total = mt.group(1) if mt else ""
     return {"invoice_no": invoice_no, "date": date, "supplier_gstin": supplier_gstin,
-            "eway": eway, "items": items, "raw_text": text}
+            "eway": eway, "invoice_total": invoice_total, "items": items, "raw_text": text}
 
 
 def read_template(uploaded):
@@ -466,7 +486,7 @@ if not invoice:
 2. Extracts supplier/invoice details and every numbered item row.
 3. Preserves duplicate product rows.
 4. Lets you correct the extracted table.
-5. Generates the **full 51-column SWIL CSV** using the working template structure.
+5. Generates the **full 38-column SWIL CSV** using the working template structure.
 
 SWIL/MARG item-code matching is intentionally **not** used in this version.
 """)
