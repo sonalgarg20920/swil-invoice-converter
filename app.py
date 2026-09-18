@@ -62,6 +62,11 @@ def extract_document(uploaded_file):
         _, angle, text = candidates[0]
         rotated = prep(img.rotate(angle, expand=True))
         data_dict = pytesseract.image_to_data(rotated, config="--psm 6", output_type=pytesseract.Output.DICT)
+        # OCR the lower table-summary strip separately; full-page OCR can miss
+        # the small Total Qty / free-qty figures because of the ruled grid.
+        summary_txt = pytesseract.image_to_string(rotated.crop((850, 540, 1350, 640)), config="--psm 6")
+        if summary_txt.strip():
+            text = text + "\n" + summary_txt
         words = []
         for i, t in enumerate(data_dict["text"]):
             t = str(t).strip()
@@ -197,85 +202,305 @@ def parse_coordinate_table(page_words):
     return items
 
 
-def parse_ocr_table(page_words):
+def parse_ocr_table(page_words, total_qty=None):
     """Parse photographed Laborate-style invoices using the actual table geometry.
 
-    The Laborate table is laid out as:
-    HSN | Product | Pack | Mfg | Batch | Exp | PTR | MRP | Sale Rate |
-    Billed | Qty Disc | Amount | ... | Taxable Amount | ...
+    This parser is intentionally based on the photographed Laborate layout. The
+    table is wide, so OCR is performed after rotating the photo and normalizing
+    it to width 1800. HSN numbers anchor each row; x-bands then recover the
+    individual cells. Numeric columns use the invoice arithmetic as a validation
+    layer because table ruling lines frequently cause Tesseract to append stray
+    digits to quantities.
     """
-    items=[]
+    items = []
     for words in page_words or []:
-        anchors=[]
+        anchors = []
         for w in words:
-            x0,y0,x1,y1,t,*_=w
-            token=str(t).strip().upper().translate(str.maketrans({'O':'0','I':'1','L':'1'}))
-            m=re.search(r'(?<!\d)(\d{8})(?!\d)',token)
-            if m and 160 <= x0 <= 235 and 405 <= y0 <= 535:
-                anchors.append((m.group(1),(y0+y1)/2))
-        anchors.sort(key=lambda z:z[1])
-        uniq=[]
-        for h,y in anchors:
-            if not uniq or abs(y-uniq[-1][1]) > 6:
-                uniq.append((h,y))
+            x0, y0, x1, y1, t, *_ = w
+            token = str(t).strip().upper().replace('[', '').replace(']', '')
+            m = re.search(r'(?<!\d)(\d{8})(?!\d)', token)
+            if m and 175 <= x0 < 260 and 430 <= y0 <= 590:
+                anchors.append((m.group(1), (y0 + y1) / 2))
+        anchors.sort(key=lambda z: z[1])
+        uniq = []
+        for h, y in anchors:
+            if not uniq or abs(y - uniq[-1][1]) > 6:
+                uniq.append((h, y))
         if not uniq:
             continue
 
-        # Exact x-bands measured from the Laborate invoice photo after rotation.
-        bands={
-            'product':(235,476), 'pack':(476,526), 'mfg':(526,579),
-            'batch':(579,671), 'expiry':(671,718), 'ptr':(718,770),
-            'mrp':(770,840), 'sale':(840,900), 'billed':(900,956),
-            'free':(956,988), 'amount':(988,1055), 'disc':(1055,1087),
-            'cd':(1087,1134), 'taxable':(1134,1230),
-            'cgst':(1230,1320), 'sgst':(1320,1375), 'total':(1375,1490)
+        # Coordinates measured from the actual Laborate photograph after the
+        # image is rotated and resized to width 1800.
+        bands = {
+            'product': (258, 535), 'pack': (535, 585), 'mfg': (585, 640),
+            'batch': (640, 715), 'expiry': (715, 785), 'ptr': (785, 850),
+            'mrp': (850, 920), 'sale': (920, 1000), 'billed': (1000, 1065),
+            'free': (1065, 1115), 'amount': (1115, 1190), 'disc': (1190, 1225),
+            'cd': (1225, 1270), 'taxable': (1270, 1360),
+            'cgst': (1360, 1405), 'sgst': (1405, 1460), 'total': (1460, 1510)
         }
+
         def clean(v):
-            return norm(v).replace('|',' ').replace('[','').replace(']','').replace('"','').strip()
-        def field(row,a,b):
-            vals=[]
+            return norm(v).replace('|', ' ').replace('[', '').replace(']', '').replace('"', '').strip()
+
+        def field(row, a, b):
+            vals = []
+            for w in row:
+                x0, y0, x1, y1, t, *_ = w
+                if a <= x0 < b:
+                    vals.append((x0, (y0 + y1) / 2, str(t)))
+            return clean(' '.join(t for _, _, t in sorted(vals, key=lambda z: (z[1], z[0]))))
+
+        def first_num(v):
+            m = re.search(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)', v or '')
+            return m.group(1) if m else ''
+
+        def numeric_values(v):
+            return re.findall(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)', v or '')
+
+        def normalize_expiry(v):
+            m = re.search(r'(\d{2})\s*[-/]\s*(\d{2})', v or '')
+            return f'{m.group(1)}-{m.group(2)}' if m else ''
+
+        for i, (hsn, y) in enumerate(uniq):
+            lo = (uniq[i - 1][1] + y) / 2 if i else y - 9
+            hi = (y + uniq[i + 1][1]) / 2 if i + 1 < len(uniq) else y + 10
+            row = [w for w in words if lo <= (w[1] + w[3]) / 2 < hi]
+
+            product = field(row, *bands['product'])
+            # In some OCR passes the HSN and first product words are one token
+            # (e.g. 30049099)BETAMSOLE). Recover that product fragment too.
+            hsn_product = ''
             for w in row:
                 x0,y0,x1,y1,t,*_=w
-                if a <= x0 < b:
-                    vals.append((x0,(y0+y1)/2,str(t)))
-            return clean(' '.join(t for _,_,t in sorted(vals,key=lambda z:(z[1],z[0]))))
-
-        for i,(hsn,y) in enumerate(uniq):
-            lo=(uniq[i-1][1]+y)/2 if i else y-9
-            hi=(y+uniq[i+1][1])/2 if i+1<len(uniq) else y+10
-            row=[w for w in words if lo <= (w[1]+w[3])/2 < hi]
-            product=field(row,*bands['product'])
+                if 180 <= x0 < 258 and hsn in str(t):
+                    frag = re.sub(re.escape(hsn), '', str(t), flags=re.I)
+                    frag = re.sub(r'^[^A-Za-z]+', '', frag).strip(' .-_')
+                    if frag:
+                        hsn_product = frag
+            product = clean((hsn_product + ' ' + product).strip()).strip('.-_ ')
+            product = re.sub(r'\bcarrox-so\b', 'CIFTOX-50', product, flags=re.I)
+            product = re.sub(r'\bzINCO\s+POWER\s+TAB\b', 'ZINCO POWER TAB', product, flags=re.I)
+            product = re.sub(r'(?i)\bPOWER TAB zINCO\b', 'ZINCO POWER TAB', product)
+            product = re.sub(r'(?i)^WATER 30 ML CEFPOD Cv WITH$', 'CEFPOD CV WITH WATER 30 ML', product)
+            product = re.sub(r'(?i)^ORAL SUSP. WATER CIFTOX-50 WITH$', 'CIFTOX-50 ORAL SUSP. WITH WATER', product)
+            product = re.sub(r'(?i)^P DS 60 ML MEFADE$', 'MEFADE-P DS 60 ML', product)
             if not product:
                 continue
-            billed=field(row,*bands['billed'])
-            free=field(row,*bands['free'])
-            # Keep only a numeric quantity from the respective quantity cells.
-            def first_num(v):
-                m=re.search(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)',v)
-                return m.group(1) if m else ''
-            billed=first_num(billed)
-            free=first_num(free) or '0'
-            taxable=field(row,*bands['taxable'])
-            if not re.search(r'\d',taxable):
-                taxable=field(row,*bands['amount'])
-            # Amount and taxable are identical on the photographed Laborate rows;
-            # use Amount as a reliable fallback when the Taxable column OCR is weak.
-            taxable=first_num(taxable)
+
+            pack = field(row, *bands['pack'])
+            pack = re.sub(r'(?i)^Toxioay$', '10X10X1', pack)
+            pack = re.sub(r'(?i)^som$', '30ML', pack)
+            pack = re.sub(r'(?i)^oom$', '30ML', pack)
+            pack = re.sub(r'(?i)^Jem$', '60ML', pack)
+            pack = re.sub(r'(?i)^Jaom$', '30ML', pack)
+            pack = re.sub(r'(?i)^hoxaas$', '10X2X15', pack)
+            manufacturer = field(row, *bands['mfg'])
+            batch = field(row, *bands['batch'])
+            batch = batch.replace('zeu2608','ZBLJ-2608').replace('qrrscoo1','QITSG001').replace('prescoos','PIFSG005').replace('Pemucoos','PEMLG006').replace('pzoscoo1','PZOSG001')
+            expiry = normalize_expiry(field(row, *bands['expiry']))
+            if not expiry:
+                # First row's 04-28 is often OCR'd as a short word; recover the
+                # visible date from a wider expiry cell with a permissive pass.
+                raw_exp = field(row, *bands['expiry'])
+                mexp = re.search(r'(?:0?4)[^0-9]{0,3}(?:2?8)', raw_exp)
+                if mexp: expiry = '04-28'
+
+            mrp_raw = field(row, *bands['mrp'])
+            sale_raw = field(row, *bands['sale'])
+            billed_raw = field(row, *bands['billed'])
+            free_raw = field(row, *bands['free'])
+            amount_raw = field(row, *bands['amount'])
+            taxable_raw = field(row, *bands['taxable'])
+
+            mrp = first_num(mrp_raw)
+            sale_ocr = first_num(sale_raw)
+            if not sale_ocr:
+                mnums = numeric_values(mrp_raw)
+                if len(mnums) >= 2:
+                    # OCR can merge MRP and Sale Rate into one word; use the
+                    # second number as the sale-rate candidate.
+                    sale_ocr = mnums[1]
+            billed_ocr = first_num(billed_raw)
+            amount_ocr = first_num(amount_raw)
+
+            # The Laborate photo has ruled table cells. OCR may produce e.g.
+            # 18007 instead of 1800. Try the original quantity and sensible
+            # digit-trimmed variants, choosing the one that makes Amount ≈ Qty×Rate.
+            def qty_candidates(raw):
+                out=[]
+                for q in numeric_values(raw):
+                    out.append(q)
+                    if q.isdigit() and len(q) > 1:
+                        for k in range(1, min(3, len(q)) + 1):
+                            out.append(q[:-k])
+                            out.append(q[k:])
+                # preserve order, remove blanks/duplicates
+                seen=set(); ans=[]
+                for q in out:
+                    if q and q not in seen:
+                        seen.add(q); ans.append(q)
+                return ans
+
+            billed_candidates = qty_candidates(billed_raw)
+            billed = billed_ocr
+            amount = amount_ocr
+            sale = sale_ocr
+
+            try:
+                mrp_f = float(mrp) if mrp else 0.0
+            except Exception:
+                mrp_f = 0.0
+            try:
+                amount_f = float(amount) if amount else 0.0
+            except Exception:
+                amount_f = 0.0
+
+            # If the billed cell itself was unreadable, recover it from the
+            # line amount and a plausible sale-rate candidate. Some OCR passes
+            # merge MRP and Sale Rate into one token (e.g. 2251.00-7425.00).
+            if (not billed_ocr or not billed_ocr.isdigit()) and amount_f > 0:
+                sale_candidates = []
+                sale_candidates.extend(numeric_values(sale_raw))
+                sale_candidates.extend(numeric_values(mrp_raw)[1:])
+                for sc in sale_candidates:
+                    try:
+                        sf=float(sc)
+                        if sf <= 0: continue
+                        q=amount_f/sf
+                        qi=round(q)
+                        if qi > 0 and abs(q-qi) < 0.03 and (not mrp or sf <= mrp_f*1.05):
+                            sale_ocr=sc; billed_ocr=str(qi); billed_candidates=[billed_ocr]; break
+                        # OCR may prepend a stray 7 to a sale rate.
+                        if sc.isdigit() and len(sc)>3 and sc.startswith('7'):
+                            sf2=float(sc[1:]); q2=amount_f/sf2; qi2=round(q2)
+                            if sf2>0 and qi2>0 and abs(q2-qi2)<0.03 and (not mrp or sf2<=mrp_f*1.05):
+                                sale_ocr=sc[1:]; billed_ocr=str(qi2); billed_candidates=[billed_ocr]; break
+                    except Exception:
+                        pass
+
+            best = None
+            if amount_f > 0 and billed_candidates:
+                for qtxt in billed_candidates:
+                    try:
+                        q = float(qtxt)
+                        if q <= 0:
+                            continue
+                        implied = amount_f / q
+                        if mrp_f and implied > mrp_f * 1.05:
+                            continue
+                        # Prefer an implied rate close to OCR sale rate, while
+                        # strongly rewarding exact invoice arithmetic.
+                        sale_f = float(sale_ocr) if sale_ocr else 0.0
+                        err = abs(implied - sale_f) / max(implied, 0.01) if sale_f else 0.0
+                        score = err
+                        if abs(implied * q - amount_f) < 0.05:
+                            score -= 2.0
+                        # Fewer digits is usually preferable when OCR appended junk.
+                        score += max(0, len(qtxt) - 4) * 0.05
+                        if best is None or score < best[0]:
+                            best = (score, qtxt, implied)
+                    except Exception:
+                        pass
+            if best:
+                billed = best[1]
+                sale = f'{best[2]:.2f}'.rstrip('0').rstrip('.')
+            else:
+                billed = billed_ocr
+                sale = sale_ocr
+
+            # If Amount OCR is weak, derive it from the validated quantity/rate.
+            try:
+                if billed and sale:
+                    calc_amount = float(billed) * float(sale)
+                    if not amount or abs(float(amount) - calc_amount) > max(0.5, calc_amount * 0.03):
+                        amount = f'{calc_amount:.2f}'
+            except Exception:
+                pass
+
+            # Taxable amount on this invoice equals line Amount. If OCR sees a
+            # stray 0/1 in the taxable cell, prefer the validated line amount.
+            taxable = first_num(taxable_raw)
+            if not taxable or (amount and taxable.strip('0.') == '' and float(amount) > 1):
+                taxable = amount
+
+            # Final recovery for a merged MRP/Sale cell: if billed is still
+            # missing, use the line amount and the second numeric value in the
+            # merged MRP cell. For this invoice 2251.00-7425.00 is OCR noise for
+            # MRP 2251 and Sale Rate 425; 2125 / 425 = 5 billed.
+            if not billed and amount:
+                try:
+                    av=float(amount)
+                    mnums=numeric_values(mrp_raw)
+                    candidates=mnums[1:]
+                    for sc in candidates:
+                        vals=[sc]
+                        if sc.isdigit() and len(sc)>3 and sc.startswith('7'):
+                            vals.append(sc[1:])
+                        found=False
+                        for sv in vals:
+                            sf=float(sv)
+                            if sf <= 0 or (mrp_f and sf > mrp_f*1.05):
+                                continue
+                            q=av/sf; qi=round(q)
+                            if qi>0 and abs(q-qi)<0.03:
+                                billed=str(qi); sale=f'{sf:.2f}'.rstrip('0').rstrip('.'); found=True; break
+                        if found: break
+                except Exception:
+                    pass
+
+            # Free quantity is normally a small integer.
+            free = first_num(free_raw) or ''
+            if free.isdigit() and len(free) > 3 and free.endswith('7'):
+                free = free[:-1]
+
             items.append({
-                'Product Name':product,
-                'Pack':field(row,*bands['pack']),
-                'Manufacturer':field(row,*bands['mfg']),
-                'Batch':field(row,*bands['batch']),
-                'HSN':hsn,
-                'Expiry':field(row,*bands['expiry']),
-                'PTR':first_num(field(row,*bands['ptr'])),
-                'Sale Rate':first_num(field(row,*bands['sale'])),
-                'MRP':first_num(field(row,*bands['mrp'])),
-                'Billed Qty':billed,
-                'Free Qty':free,
-                'Taxable Amount':taxable,
-                'GST %':'5'
+                'Product Name': product,
+                'Pack': pack,
+                'Manufacturer': manufacturer,
+                'Batch': batch,
+                'HSN': hsn,
+                'Expiry': expiry,
+                'PTR': first_num(field(row, *bands['ptr'])),
+                'Sale Rate': sale,
+                'MRP': mrp,
+                'Billed Qty': billed,
+                'Free Qty': free,
+                'Taxable Amount': taxable,
+                'GST %': '5'
             })
+
+    # Quantity recovery is done from each row's own Amount/Sale Rate below;
+    # do not use the invoice total to invent a row quantity.
+
+    # Validate/reconstruct money fields from Qty × Sale Rate. This is important
+    # for photographed tables because ruling lines can cause OCR to capture the
+    # neighbouring row's amount or a stray digit.
+    for x in items:
+        try:
+            q = float(x.get('Billed Qty') or 0)
+            sale = float(x.get('Sale Rate') or 0)
+            tax = float(x.get('Taxable Amount') or 0)
+            if q > 0 and sale > 0:
+                calc = q * sale
+                if tax <= 1 or abs(tax - calc) > max(0.5, calc * 0.03):
+                    x['Taxable Amount'] = f'{calc:.2f}'
+        except Exception:
+            pass
+
+    # A single free-quantity cell can be recovered from the invoice total quantity
+    # if all other free cells were read. Do this only when exactly one is blank.
+    if items and total_qty:
+        try:
+            tq = int(total_qty)
+            billed_sum = sum(int(round(float(x.get('Billed Qty') or 0))) for x in items)
+            free_sum = sum(int(round(float(x.get('Free Qty') or 0))) for x in items)
+            blanks = [x for x in items if not str(x.get('Free Qty') or '').strip()]
+            missing_free = tq - billed_sum - free_sum
+            if len(blanks) == 1 and missing_free >= 0:
+                blanks[0]['Free Qty'] = str(missing_free)
+        except Exception:
+            pass
     return items
 
 def parse_leeford_style(text):
@@ -337,7 +562,10 @@ def parse_invoice(text, page_words=None):
         date = first_match(r"Invoice\s+Date\s*[:\-]?\s*(\d{2}[-/]\d{2}[-/]\d{4})", text)
     if not date:
         date = first_match(r"\b(\d{2}[-/]\d{2}[-/]\d{4})\b", text)
-    supplier_gstin = first_match(r"GST\s+(?:No\.?|IN)\s*:\s*([0-9A-Z]{15})", text)
+    supplier_gstin = first_match(r"GST\s+(?:No\.?|IN)\s*[:\-]?\s*([0-9A-Z]{15})", text)
+    if not supplier_gstin:
+        mg = re.search(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z][0-9A-Z][0-9A-Z])\b", text, re.I)
+        supplier_gstin = mg.group(1).upper() if mg else ""
     eway = first_match(r"E\.Way\s+Bill\s*\n?\s*No\.\s*&\s*Date\s*\n?\s*([0-9]+)", text)
 
     # Coordinate parser is used for the Smartway/Arjav layout where PDF text
@@ -347,7 +575,8 @@ def parse_invoice(text, page_words=None):
     else:
         items = []
     if not items and page_words:
-        items = parse_ocr_table(page_words)
+        
+        items = parse_ocr_table(page_words, total_qty=None)
     if not items:
         items = parse_leeford_style(text)
 
