@@ -164,6 +164,157 @@ def parse_coordinate_table(page_words):
     return items
 
 
+
+HEADER_ALIASES = {
+    "serial": ["s", "sr", "sr.", "s.no", "s.no.", "sl", "sl.", "sl.no", "sl.no."],
+    "qty": ["qty", "quantity", "billed qty", "bill qty", "sale qty"],
+    "free_qty": ["free", "free qty", "free quantity", "qty disc", "quantity disc", "scheme qty", "bonus qty"],
+    "manufacturer": ["mfr", "mfg", "manufacturer", "company", "maker"],
+    "pack": ["pack", "packing", "mfr pack", "package"],
+    "product": ["product", "product name", "item", "item name", "description", "product description", "medicine", "drug name"],
+    "batch": ["batch", "batch no", "batch no.", "lot", "lot no", "lot no."],
+    "expiry": ["exp", "expiry", "expiry date", "exp date", "expiration"],
+    "hsn": ["hsn", "hsn code", "hsn/sac", "hsn sac"],
+    "mrp": ["mrp", "m.r.p."],
+    "ptr": ["ptr", "pts", "pts rate", "purchase rate", "p.rate"],
+    "rate": ["rate", "sale rate", "selling rate", "unit rate", "price"],
+    "discount": ["dis", "disc", "discount", "disc %", "discount %"],
+    "cgst": ["cgst", "cgst %", "cgst%"],
+    "sgst": ["sgst", "sgst %", "sgst%"],
+    "igst": ["igst", "igst %", "igst%"],
+    "amount": ["amount", "taxable", "taxable amount", "value", "gross amount"],
+    "net": ["net", "net amount", "total", "line total", "net value"],
+}
+
+def _header_norm(s):
+    s = str(s or "").lower().replace("\n", " ").replace(".", "")
+    s = re.sub(r"[^a-z0-9%/ ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def _alias_match(s):
+    h = _header_norm(s)
+    # Exact matching is deliberate: it prevents a header phrase such as
+    # "Qty Mfr" from being misclassified as "Mfr".
+    for field, aliases in HEADER_ALIASES.items():
+        for alias in aliases:
+            if h == _header_norm(alias):
+                return field
+    return None
+
+def _find_header_map(words):
+    if not words:
+        return None
+    rows = {}
+    for w in words:
+        x0, y0, x1, y1, t, *_ = w
+        yc = round(((y0 + y1) / 2) / 3) * 3
+        rows.setdefault(yc, []).append(w)
+
+    candidates = []
+    for yc, row in rows.items():
+        row = sorted(row, key=lambda w: w[0])
+        pieces = []
+        for i, w in enumerate(row):
+            pieces.append((w[0], w[2], str(w[4])))
+            if i + 1 < len(row):
+                pieces.append((w[0], row[i+1][2], f"{w[4]} {row[i+1][4]}"))
+            if i + 2 < len(row):
+                pieces.append((w[0], row[i+2][2], f"{w[4]} {row[i+1][4]} {row[i+2][4]}"))
+        found = {}
+        for x0, x1, label in pieces:
+            field = _alias_match(label)
+            if field:
+                score = len(_header_norm(label))
+                if field not in found or score > found[field][0]:
+                    found[field] = (score, (x0+x1)/2, label)
+        if len(found) >= 3 and any(k in found for k in ("product", "hsn", "batch", "qty", "mrp")):
+            candidates.append((len(found), yc, found))
+
+    if not candidates:
+        return None
+
+    _, header_y, found = max(candidates, key=lambda x: (x[0], -x[1]))
+    cols = sorted([(v[1], f, v[2]) for f, v in found.items()], key=lambda x: x[0])
+    boundaries = []
+    for i, (center, field, label) in enumerate(cols):
+        left = -1e9 if i == 0 else (cols[i-1][0] + center)/2
+        right = 1e9 if i == len(cols)-1 else (center + cols[i+1][0])/2
+        boundaries.append((field, left, right))
+    return header_y, boundaries
+
+def parse_header_driven_table(page_words):
+    items = []
+    for words in page_words or []:
+        found = _find_header_map(words)
+        if not found:
+            continue
+        header_y, columns = found
+
+        # Find numbered item rows below the header.
+        anchors = []
+        for w in words:
+            x0, y0, x1, y1, t, *_ = w
+            if (y0+y1)/2 > header_y + 8 and x0 < 80 and re.fullmatch(r"\d+\.?", str(t).strip()):
+                anchors.append((y0+y1)/2)
+        anchors = sorted(set(round(y,1) for y in anchors))
+
+        for i, y in enumerate(anchors):
+            hi = ((y + anchors[i+1])/2) if i+1 < len(anchors) else y+8
+            lo = y-4
+            row = [w for w in words if lo <= (w[1]+w[3])/2 < hi]
+            vals = {}
+            for field, left, right in columns:
+                tokens = []
+                for w in row:
+                    x0, y0, x1, y1, t, *_ = w
+                    xc = (x0 + x1) / 2
+                    if left <= xc < right:
+                        tokens.append((xc, str(t)))
+                vals[field] = " ".join(t for _,t in sorted(tokens)).strip()
+
+            product = norm(vals.get("product",""))
+            hsn = norm(vals.get("hsn",""))
+            if not product:
+                continue
+            if hsn and not re.fullmatch(r"\d{8}", re.sub(r"\D","",hsn)):
+                continue
+
+            batch = norm(vals.get("batch",""))
+            if batch:
+                product = norm(re.sub(r"(?<!\w)"+re.escape(batch)+r"(?!\w)","",product,flags=re.I))
+
+            try:
+                gst = f"{float(vals.get('cgst','') or 0)+float(vals.get('sgst','') or 0):g}"
+                if gst == "0": gst = ""
+            except ValueError:
+                gst = ""
+            gst = norm(vals.get("igst","")) or gst or "5"
+
+            items.append({
+                "Product Name": product,
+                "Pack": norm(vals.get("pack","")),
+                "Manufacturer": norm(vals.get("manufacturer","")),
+                "Batch": batch,
+                "HSN": hsn,
+                "Expiry": norm(vals.get("expiry","")),
+                "PTR": norm(vals.get("ptr","") or vals.get("rate","")),
+                "Sale Rate": norm(vals.get("rate","")),
+                "MRP": norm(vals.get("mrp","")),
+                "Billed Qty": norm(vals.get("qty","")),
+                "Free Qty": norm(vals.get("free_qty","")),
+                "Taxable Amount": norm(vals.get("amount","")),
+                "GST %": gst,
+            })
+
+    unique, seen = [], set()
+    for item in items:
+        key = tuple(item.get(k,"") for k in ("Product Name","Pack","Batch","HSN","Expiry","Billed Qty","Free Qty","MRP","Sale Rate"))
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
 def parse_arjav_style(page_words):
     """Parse the Arjav Pharma invoice table using fixed visual column bands."""
     items = []
@@ -318,13 +469,14 @@ def parse_invoice(text, page_words=None):
 
     eway = first_match(r"E\.Way\s+Bill\s*\n?\s*No\.\s*&\s*Date\s*\n?\s*([0-9]+)", text)
 
-    # Arjav has a distinct visual table layout, so use its own coordinate parser.
-    if re.search(r"ARJAV PHARMA", text, re.I) and page_words:
+    # Discover the invoice table from the printed column headers first.
+    items = parse_header_driven_table(page_words) if page_words else []
+
+    # Existing supplier-specific parsers remain as fallbacks.
+    if not items and re.search(r"ARJAV PHARMA", text, re.I) and page_words:
         items = parse_arjav_style(page_words)
-    elif re.search(r"SMARTWAY", text, re.I) and page_words:
+    elif not items and re.search(r"SMARTWAY", text, re.I) and page_words:
         items = parse_coordinate_table(page_words)
-    else:
-        items = []
 
     if not items:
         items = parse_leeford_style(text)
