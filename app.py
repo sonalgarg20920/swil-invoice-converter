@@ -30,52 +30,14 @@ def extract_document(uploaded_file):
         import pytesseract
         if not shutil.which("tesseract"):
             raise RuntimeError("Tesseract OCR engine is not installed on this server. Add packages.txt with tesseract-ocr and redeploy.")
-        img = Image.open(io.BytesIO(data))
-        try:
-            img = ImageOps.exif_transpose(img)
-        except Exception:
-            pass
-        img = img.convert("RGB")
-
-        def prep(im):
-            gray = ImageOps.grayscale(im)
-            if max(gray.size) < 1800:
-                scale = 1800 / max(gray.size)
-                gray = gray.resize((int(gray.width * scale), int(gray.height * scale)))
-            return gray
-
-        candidates = []
-        for angle in (0, 90, 180, 270):
-            rotated = img.rotate(angle, expand=True)
-            gray = prep(rotated)
-            txt = pytesseract.image_to_string(gray, config="--psm 6")
-            upper = txt.upper()
-            score = sum(10 for kw in (
-                "TAX INVOICE", "BILL NO", "PRODUCT NAME", "QUANTITY",
-                "MRP", "TOTAL", "GST", "LABORATE", "AHUJA"
-            ) if kw in upper)
-            score += min(len(re.findall(r"\b\d{8}\b", txt)), 12) * 2
-            score += min(len(txt), 3000) / 3000
-            candidates.append((score, angle, txt))
-
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        _, angle, text = candidates[0]
-        rotated = prep(img.rotate(angle, expand=True))
-        data_dict = pytesseract.image_to_data(rotated, config="--psm 6", output_type=pytesseract.Output.DICT)
-        # OCR the lower table-summary strip separately; full-page OCR can miss
-        # the small Total Qty / free-qty figures because of the ruled grid.
-        summary_txt = pytesseract.image_to_string(rotated.crop((850, 540, 1350, 640)), config="--psm 6")
-        if summary_txt.strip():
-            text = text + "\n" + summary_txt
-        words = []
-        for i, t in enumerate(data_dict["text"]):
-            t = str(t).strip()
-            if not t:
-                continue
-            x, y = data_dict["left"][i], data_dict["top"][i]
-            w, h = data_dict["width"][i], data_dict["height"][i]
-            words.append((x, y, x + w, y + h, t, 0, 0, 0))
-        return text, [words]
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        # Light preprocessing improves OCR on photographed/low-contrast invoices.
+        gray = ImageOps.grayscale(img)
+        if max(gray.size) < 1800:
+            scale = 1800 / max(gray.size)
+            gray = gray.resize((int(gray.width * scale), int(gray.height * scale)))
+        text = pytesseract.image_to_string(gray, config="--psm 6")
+        return text, None
     except Exception as e:
         raise RuntimeError(f"Could not OCR the image: {e}") from e
 
@@ -202,226 +164,92 @@ def parse_coordinate_table(page_words):
     return items
 
 
-def parse_ocr_table(page_words, total_qty=None):
-    """Parse photographed Laborate-style invoices.
-
-    Laborate's photographed table is small and heavily ruled, so OCR often
-    merges adjacent numeric cells.  We therefore use HSNs as row anchors,
-    strict visual column bands, and arithmetic (qty * sale rate = amount) to
-    repair common OCR concatenation errors.
-    """
+def parse_arjav_style(page_words):
+    """Parse the Arjav Pharma invoice table using fixed visual column bands."""
     items = []
+
     for words in page_words or []:
-        # This parser receives OCR coordinates from an image resized so its
-        # longest side is 1800 px.  On the supplied Laborate photo the HSN
-        # column is around x=190-260 and the six HSNs are reliable row anchors.
-        hsn_hits = []
+        # Every item row begins with a numbered serial such as 1., 2., 3.
+        anchors = []
         for w in words:
             x0, y0, x1, y1, t, *_ = w
-            tok = str(t).strip().replace('|','').replace('[','').replace(']','')
-            m = re.search(r'(?<!\d)(\d{8})(?!\d)', tok)
-            if m and 175 <= x0 < 270 and 450 <= y0 <= 620:
-                hsn_hits.append((m.group(1), (y0+y1)/2))
-        hsn_hits.sort(key=lambda z:z[1])
+            token = str(t).strip()
+            if x0 < 45 and re.fullmatch(r"\d+\.", token):
+                anchors.append((int(token[:-1]), (y0 + y1) / 2))
 
-        # Keep the invoice's six HSN rows in visual order.  Do not merge rows
-        # merely because two HSN OCR boxes overlap slightly.
-        anchors = []
-        for h, y in hsn_hits:
-            if not anchors or abs(y - anchors[-1][1]) > 4:
-                anchors.append((h, y))
-            elif len(h) == 8 and h != anchors[-1][0]:
-                # Prefer a clean 8-digit token when OCR produced two versions
-                # at nearly the same y.
-                anchors[-1] = (h, y)
-        # The table normally has 6 detail rows; cap obvious footer/header noise.
-        anchors = [a for a in anchors if 465 <= a[1] <= 610]
+        anchors.sort(key=lambda z: z[1])
         if not anchors:
             continue
 
-        # Visual x-bands in the 1800px OCR image.
-        bands = {
-            'product': (255, 535),
-            'pack': (535, 590),
-            'mfg': (590, 643),
-            'batch': (643, 755),
-            'expiry': (755, 850),
-            'mrp': (850, 922),
-            'sale': (922, 1013),
-            'billed': (1013, 1070),
-            'free': (1070, 1110),
-            'amount': (1108, 1180),
-            'taxable': (1265, 1345),
-        }
-
-        def clean(v):
-            v = norm(v)
-            v = v.replace('|',' ').replace('[','').replace(']','').replace('"','')
-            v = re.sub(r'\s+', ' ', v).strip()
-            return v
-
-        def cell(row, a, b):
-            vals=[]
-            for w in row:
-                x0,y0,x1,y1,t,*_ = w
-                if a <= x0 < b:
-                    vals.append((y0,x0,str(t)))
-            return clean(' '.join(t for _,_,t in sorted(vals)))
-
-        def nums(v):
-            return re.findall(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)', v or '')
-
-        def first_num(v):
-            m=re.search(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)', v or '')
-            return m.group(1) if m else ''
-
-        def expiry(v):
-            m=re.search(r'(\d{1,2})\s*[-/]\s*(\d{2,4})', v or '')
-            if not m: return ''
-            month=int(m.group(1)); year=int(m.group(2))
-            if 1 <= month <= 12:
-                return f'{month:02d}-{year%100:02d}'
-            return ''
-
-        def qty_clean(raw):
-            """Extract a quantity from noisy OCR such as 18007 -> 1800."""
-            raw = raw or ''
-            cands=[]
-            for n in nums(raw):
-                cands.append(n)
-                # OCR commonly appends one stray digit/symbol to a quantity.
-                if len(n) >= 2:
-                    for k in range(1, min(2, len(n))+1):
-                        cands.append(n[:-k])
-            seen=set(); out=[]
-            for q in cands:
-                if q and q not in seen:
-                    seen.add(q); out.append(q)
-            return out
-
-        def choose_qty(raw, amount, sale):
-            cands=qty_clean(raw)
-            if not cands: return ''
-            try:
-                a=float(amount or 0); r=float(sale or 0)
-            except Exception:
-                a=r=0
-            if a>0 and r>0:
-                best=None
-                for q in cands:
-                    try:
-                        qf=float(q); err=abs(qf*r-a)
-                        if qf>0 and (best is None or err<best[0]): best=(err,q)
-                    except Exception: pass
-                if best and best[0] <= max(1.0, a*0.03):
-                    return best[1]
-            # Prefer the shortest plausible integer after stripping an OCR tail.
-            return min(cands, key=lambda q:(len(q), q))
-
-        for idx, (anchor_hsn, y) in enumerate(anchors):
-            lo = (anchors[idx-1][1] + y)/2 if idx else y-10
-            hi = (y + anchors[idx+1][1])/2 if idx+1 < len(anchors) else y+12
-            row=[w for w in words if lo <= (w[1]+w[3])/2 < hi]
-            hsn=anchor_hsn
-
-            product=cell(row,*bands['product'])
-            product=re.sub(r'^\W+|\W+$','',product)
-            # Clean common OCR artefacts without relying on a single invoice's
-            # exact spelling.
-            product=re.sub(r'(?i)^1\s*', '', product).strip()
-            replacements=[
-                (r'(?i)BETANSOLE\s+IN[}.]?','BETAMSOLE INJ.'),
-                (r'(?i)BETAMSOLE\s+IN[}.]?','BETAMSOLE INJ.'),
-                (r'(?i)CEFPOD\s+CV\s+WITH\s+WATER\s*30\s*ML','CEFPOD CV WITH WATER 30 ML'),
-                (r'(?i)C[Il]FTOX[- ]?50\s+ORAL\s+SUSP\.?\s+WITH\s+WATER','CIFTOX-50 ORAL SUSP. WITH WATER'),
-                (r'(?i)MEFADE[- ]?P\s*DS\s*60\s*ML','MEFADE-P DS 60 ML'),
-                (r'(?i)OFLOCIN\s+SUSPENSION','OFLOCIN SUSPENSION'),
-                (r'(?i)ZINCO\s+POWER\s+TAB','ZINCO POWER TAB'),
+        for sr, y in anchors:
+            # Rows in this invoice are about 10.5 px apart. A narrow band
+            # prevents neighboring rows from being mixed together.
+            row = [
+                w for w in words
+                if abs(((w[1] + w[3]) / 2) - y) <= 4.8
             ]
-            for pat,val in replacements: product=re.sub(pat,val,product)
 
-            pack=cell(row,*bands['pack'])
-            pack=re.sub(r'[^A-Za-z0-9Xx]','',pack)
-            mfg=cell(row,*bands['mfg'])
-            batch=cell(row,*bands['batch'])
-            batch=re.sub(r'[^A-Za-z0-9-]','',batch)
-            # Correct common OCR substitutions in batch numbers.
-            batch=batch.replace('ZBU','ZBLJ').replace('QITSGO01','QITSG001').replace('PIFSGOOS','PIFSG005').replace('PEMLGO06','PEMLG006').replace('PZOSGOO1','PZOSG001')
+            def col(xmin, xmax):
+                vals = []
+                for w in row:
+                    x0, y0, x1, y1, t, *_ = w
+                    if xmin <= x0 < xmax:
+                        vals.append((x0, str(t)))
+                return " ".join(t for _, t in sorted(vals))
 
-            exp=expiry(cell(row,*bands['expiry']))
-            mrp_raw=cell(row,*bands['mrp'])
-            sale_raw=cell(row,*bands['sale'])
-            billed_raw=cell(row,*bands['billed'])
-            free_raw=cell(row,*bands['free'])
-            amount_raw=cell(row,*bands['amount'])
-            taxable_raw=cell(row,*bands['taxable'])
+            qty = col(65, 112)
+            manufacturer = col(112, 145)
+            pack = col(145, 181)
+            product = col(181, 378)
+            batch = col(378, 435)
+            expiry = col(435, 460)
+            hsn = col(460, 510)
+            mrp = col(510, 560)
+            rate = col(560, 610)
+            discount = col(610, 640)
+            sgst = col(640, 670)
+            cgst = col(670, 715)
+            amount = col(715, 778)
 
-            # OCR-specific numeric cleanup.
-            mrp_raw=mrp_raw.replace('§','5').replace('S','5').replace('O','0')
-            sale_raw=sale_raw.replace(',','.').replace('O','0')
-            amount_raw=amount_raw.replace(',','.').replace('S','5')
-            taxable_raw=taxable_raw.replace(',','.').replace('S','5')
+            if not re.fullmatch(r"\d{8}", hsn.strip()):
+                continue
 
-            mrp=first_num(mrp_raw)
-            sale=first_num(sale_raw)
-            amount=first_num(amount_raw)
-            taxable=first_num(taxable_raw)
-            billed=choose_qty(billed_raw, amount, sale)
-            free=first_num(free_raw)
+            product = norm(product)
+            batch = norm(batch)
 
-            # If amount was OCR'd as 5289 instead of 5280, the arithmetic using
-            # quantity and sale is more trustworthy.
+            if batch:
+                product = re.sub(
+                    r"(?<!\w)" + re.escape(batch) + r"(?!\w)",
+                    "",
+                    product,
+                    flags=re.I,
+                )
+                product = norm(product)
+
             try:
-                q=float(billed or 0); r=float(sale or 0); a=float(amount or 0)
-                if q>0 and r>0:
-                    calc=q*r
-                    if not a or abs(a-calc)>max(1,calc*.02):
-                        amount=f'{calc:.2f}'
-                    taxable=f'{calc:.2f}'
-                elif q>0 and a>0 and not r:
-                    sale=f'{a/q:.2f}'
-                    taxable=f'{a:.2f}'
-            except Exception:
-                pass
+                gst = f"{float(sgst) + float(cgst):g}"
+            except ValueError:
+                gst = "5"
 
-            # Recover rows where OCR drops the quantity entirely by using the
-            # printed taxable/amount and sale rate.
-            if not billed:
-                try:
-                    a=float(amount or taxable or 0); r=float(sale or 0)
-                    if a>0 and r>0:
-                        q=a/r
-                        if abs(q-round(q))<0.02:
-                            billed=str(int(round(q)))
-                except Exception:
-                    pass
-
-            # For this invoice family the pack is consistently visible and the
-            # HSN provides a safe fallback when OCR mangles the pack cell.
-            pack_by_hsn={
-                '30049099':'10X10X1','30042019':'30ML','30049066':'60ML',
-                '30042034':'30ML','21061000':'10X2X15'
-            }
-            if hsn in pack_by_hsn: pack=pack_by_hsn[hsn]
-
-            # The PTR column is visually present but marked *, with no numeric
-            # PTR on this invoice. Leave it blank rather than inventing a value.
             items.append({
-                'Product Name':product,
-                'Pack':pack,
-                'Manufacturer':mfg,
-                'Batch':batch,
-                'HSN':hsn,
-                'Expiry':exp,
-                'PTR':'',
-                'Sale Rate':sale,
-                'MRP':mrp,
-                'Billed Qty':billed,
-                'Free Qty':free,
-                'Taxable Amount':taxable or amount,
-                'GST %':'5'
+                "Product Name": product,
+                "Pack": norm(pack),
+                "Manufacturer": norm(manufacturer),
+                "Batch": batch,
+                "HSN": hsn.strip(),
+                "Expiry": norm(expiry),
+                # Keep the supplier columns literal: MRP is MRP and Rate is the purchase/rate field.
+                "PTR": norm(rate),
+                "Sale Rate": norm(rate),
+                "MRP": norm(mrp),
+                "Billed Qty": norm(qty),
+                "Free Qty": "",
+                "Taxable Amount": norm(amount),
+                "GST %": gst,
             })
+
     return items
+
 
 def parse_leeford_style(text):
     """Fallback parser for the original Leeford-style invoices."""
@@ -477,35 +305,41 @@ def parse_leeford_style(text):
 
 def parse_invoice(text, page_words=None):
     invoice_no = first_match(r"Bill\s+No\.?\s*:\s*([^\n]+)", text)
-    date = first_match(r"(?:\bDATE|Date)\s*[:\-]?\s*(\d{2}[-/]\d{2}[-/]\d{4})", text)
+    if not invoice_no:
+        invoice_no = first_match(r"Invoice\s+No\.?\s*[:]?\s*([^\n]+)", text)
+
+    date = first_match(r"\bDATE\s*\n?\s*(\d{2}-\d{2}-\d{4})", text)
     if not date:
-        date = first_match(r"Invoice\s+Date\s*[:\-]?\s*(\d{2}[-/]\d{2}[-/]\d{4})", text)
-    if not date:
-        date = first_match(r"\b(\d{2}[-/]\d{2}[-/]\d{4})\b", text)
-    supplier_gstin = first_match(r"GST\s+(?:No\.?|IN)\s*[:\-]?\s*([0-9A-Z]{15})", text)
+        date = first_match(r"Invoice\s+Date\s+(\d{2}-\d{2}-\d{4})", text)
+
+    supplier_gstin = first_match(r"GST\s+(?:No\.?|IN)\s*:\s*([0-9A-Z]{15})", text)
     if not supplier_gstin:
-        mg = re.search(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z][0-9A-Z][0-9A-Z])\b", text, re.I)
-        supplier_gstin = mg.group(1).upper() if mg else ""
+        supplier_gstin = first_match(r"GSTIN\s*:\s*([0-9A-Z]{15})", text)
+
     eway = first_match(r"E\.Way\s+Bill\s*\n?\s*No\.\s*&\s*Date\s*\n?\s*([0-9]+)", text)
 
-    # Coordinate parser is used for the Smartway/Arjav layout where PDF text
-    # is column-major. Other PDFs continue through the original fallback.
-    if re.search(r"SMARTWAY|ARJAV PHARMA", text, re.I) and page_words:
+    # Arjav has a distinct visual table layout, so use its own coordinate parser.
+    if re.search(r"ARJAV PHARMA", text, re.I) and page_words:
+        items = parse_arjav_style(page_words)
+    elif re.search(r"SMARTWAY", text, re.I) and page_words:
         items = parse_coordinate_table(page_words)
     else:
         items = []
-    if not items and page_words:
-        
-        items = parse_ocr_table(page_words, total_qty=None)
+
     if not items:
         items = parse_leeford_style(text)
 
-    invoice_total = first_match(r"Total\s*(?:->\s*)?(?:Qty\s*:\s*\d+\s*)?\s*([0-9]+(?:\.[0-9]{1,2})?)", text)
+    # Arjav prints the final payable amount as "Grand Total".
+    invoice_total = first_match(r"Grand\s+Total\s*:?\s*([\d,]+(?:\.\d+)?)", text)
+    if not invoice_total and re.search(r"ARJAV PHARMA", text, re.I):
+        # Some Arjav PDFs put the numeric grand total in a separate visual box,
+        # so PDF text order does not keep it beside the "Grand Total" label.
+        money = re.findall(r"\b\d{4,8}(?:,\d{3})*\.\d{2}\b", text)
+        if money:
+            invoice_total = money[-1]
     if not invoice_total:
-        # Laborate summary usually contains a line such as Total -> Qty: 2885
-        # followed by the grand total in the same OCR block.
-        mt = re.search(r"Total.*?(\d{4,}(?:\.\d{1,2})?)", text, re.I|re.S)
-        invoice_total = mt.group(1) if mt else ""
+        invoice_total = first_match(r"TOTAL\s+([\d,]+(?:\.\d+)?)\s*$", text)
+
     return {"invoice_no": invoice_no, "date": date, "supplier_gstin": supplier_gstin,
             "eway": eway, "invoice_total": invoice_total, "items": items, "raw_text": text}
 
@@ -635,7 +469,7 @@ if not invoice:
 2. Extracts supplier/invoice details and every numbered item row.
 3. Preserves duplicate product rows.
 4. Lets you correct the extracted table.
-5. Generates the **full 38-column SWIL CSV** using the working template structure.
+5. Generates the **38-column SWIL CSV** using the known-good import structure.
 
 SWIL/MARG item-code matching is intentionally **not** used in this version.
 """)
