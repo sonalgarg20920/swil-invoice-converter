@@ -940,8 +940,8 @@ def parse_laborate_image_v19(page_words, text):
         bands_ref = {
             "hsn": (165, 230), "product": (230, 475), "pack": (475, 525),
             "manufacturer": (525, 570), "batch": (570, 670), "expiry": (670, 755),
-            "mrp": (750, 820), "sale": (820, 880), "billed": (890, 950),
-            "free": (950, 990), "amount": (990, 1070), "taxable": (1120, 1195),
+            "mrp": (750, 820), "sale": (835, 875), "billed": (890, 945),
+            "free": (945, 985), "amount": (985, 1055), "taxable": (1125, 1188),
         }
         bands = {k: (a*sx, b*sx) for k,(a,b) in bands_ref.items()}
 
@@ -1156,28 +1156,43 @@ def parse_laborate_image_v19(page_words, text):
             rows.append({"Product Name":product,"Pack":pack,"Manufacturer":manufacturer,"Batch":batch,"HSN":hsn,"Expiry":expiry,"PTR":"","Sale Rate":fmt(sale),"MRP":fmt(mrp),"Billed Qty":fmt(billed),"Free Qty":"","Taxable Amount":fmt(taxable),"GST %":"5"})
             free_lists.append(sorted(set(free_cands)))
 
-        # Resolve free quantities against the printed footer total. This avoids
-        # accepting OCR tails such as 2007 while preserving genuine blanks.
+        # Resolve free quantities against the printed footer total. The OCR
+        # often reads 200 as 2007 and 18 as 327, so allow the invoice total
+        # to determine the residual free quantity.
         if footer_free is not None:
             candidates=[]
             for lst in free_lists:
-                opts=sorted(set([0]+lst), key=lambda q:(abs(q-20),q))
-                candidates.append(opts[:8])
-            best=None
-            import itertools
-            for combo in itertools.product(*candidates):
-                if sum(combo)!=footer_free: continue
-                # Prefer small OCR edits and the visible row-1 200 when present.
-                score=0
-                for i,q in enumerate(combo):
-                    if free_lists[i] and q in free_lists[i]: score+=0
-                    elif q==0: score+=1
-                    else: score+=2
-                if best is None or score<best[0]: best=(score,combo)
-            if best:
-                for i,q in enumerate(best[1]): rows[i]["Free Qty"]=fmt(q)
+                opts={0}
+                for q in lst:
+                    if 0 <= q <= 500:
+                        opts.add(q)
+                candidates.append(sorted(opts))
+            # First prefer the obvious OCR candidates, then allow one residual
+            # row to absorb the difference (e.g. 200 + 20 + 18 = 238).
+            chosen=[0]*len(rows)
+            remaining=footer_free
+            for i,lst in enumerate(free_lists):
+                vals=[q for q in lst if q>0 and q<=remaining]
+                if vals:
+                    # Prefer the largest plausible OCR value, which preserves
+                    # 200 and 20 rather than their truncated 20/2 variants.
+                    chosen[i]=max(vals)
+                    remaining-=chosen[i]
+            if remaining>0:
+                # Put residual on the row whose OCR candidate was malformed.
+                target=None
+                for i,lst in enumerate(free_lists):
+                    if chosen[i]==0:
+                        target=i; break
+                if target is not None and remaining<=500:
+                    chosen[target]=remaining
+                    remaining=0
+            if remaining==0 and sum(chosen)==footer_free:
+                for i,q in enumerate(chosen): rows[i]["Free Qty"]=fmt(q)
+            else:
+                for i,lst in enumerate(free_lists): rows[i]["Free Qty"]=fmt(max(lst) if lst else 0)
         else:
-            for i,lst in enumerate(free_lists): rows[i]["Free Qty"]=fmt(lst[0] if lst else 0)
+            for i,lst in enumerate(free_lists): rows[i]["Free Qty"]=fmt(max(lst) if lst else 0)
 
         return rows
     except Exception:
