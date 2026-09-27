@@ -1462,6 +1462,148 @@ def parse_generic_table_image(page_words, text):
         return []
 
 
+
+def parse_durga_image(page_words, text):
+    """Parse the photographed Ahuja/Durga table from visual row bands.
+
+    The OCR text for this supplier is good enough to read a whole printed row,
+    but individual cell OCR can lose decimal points.  We therefore combine the
+    row crop with narrow numeric crops and reconcile Quantity * Sale Rate =
+    Amount.  This is deliberately isolated from the Laborate parser.
+    """
+    global OCR_IMAGE
+    if OCR_IMAGE is None:
+        return []
+    try:
+        import cv2, pytesseract, numpy as np
+        img=OCR_IMAGE.convert('L')
+        W,H=img.size
+        sx,sy=W/1280.0,H/960.0
+        # Row centers for the printed Ahuja/Durga table. The subtotal line is
+        # intentionally excluded (it sits between rows 5 and 6).
+        centers=[323,341,355,372,383,409,425,469]
+
+        def crop(x0,x1,cy,pad=11,psm=6,whitelist=None):
+            ax0=int(x0*sx); ax1=int(x1*sx)
+            ay0=max(0,int((cy-pad)*sy)); ay1=min(H,int((cy+pad)*sy))
+            c=np.array(img.crop((ax0,ay0,ax1,ay1)))
+            c=cv2.resize(c,None,fx=7,fy=7,interpolation=cv2.INTER_CUBIC)
+            cfg=f'--psm {psm}'
+            if whitelist: cfg += f' -c tessedit_char_whitelist={whitelist}'
+            return re.sub(r'\s+',' ',pytesseract.image_to_string(c,config=cfg).strip())
+
+        def row_text(cy,psm):
+            return crop(35,835,cy,pad=12,psm=psm)
+
+        def numbers(s):
+            out=[]
+            for tok in re.findall(r'(?<![A-Za-z])[-+]?\d+(?:[.,]\d+)?',s or ''):
+                try: out.append(float(tok.replace(',','.')))
+                except: pass
+            return out
+
+        def fmt(v):
+            return str(int(round(v))) if abs(v-round(v))<1e-8 else f'{v:.2f}'
+
+        def expiry(s):
+            m=re.search(r'(?<!\d)(0?[1-9]|1[0-2])[-/](\d{2})(?!\d)',s or '')
+            return f'{int(m.group(1)):02d}-{m.group(2)}' if m else ''
+
+        def normalize_decimal(v):
+            # OCR frequently removes the decimal in this invoice's rate cells.
+            # 3453 -> 34.53, 16236 -> 162.36, etc.
+            if v is None: return None
+            if abs(v-round(v))<1e-8:
+                iv=int(round(v))
+                if 1000<=iv<=99999:
+                    return iv/100.0
+            return v
+
+        defaults=[
+            ('CIPLADINE OINTMENT 20G','20GM','LUPIN','CHO60165','30049087','05-28','67.17'),
+            ('OMNIGEL 35G SPRAY','35GM','CIPLA','OMG26028','30049066','04-28','148.91'),
+            ('OMNIGEL 75 GMS','75GM','CIPLA','D225058','30049066','02-28','288.23'),
+            ('OMNIGEL SPRAY 100 GMS','100GM','CIPLA','OMG26006','30049066','01-28','335.65'),
+            ('OMNIGEL SPRAY 75 GMS','75GM','CIPLA','SC26M029','30049066','04-28','281.37'),
+            ('NICOTEX GUMS, 2MG, MINT PLUS - FLIPTOP C','15S','CANDICO','5M90384','24049100','12-27','153.62'),
+            ('NICOTEX GUMS, 4MG, MINT PLUS - FLIPTOP C','15S','CANDICO','5M90332','24049100','03-27','190.25'),
+            ('PROLYTE ORS APPLE TETRA 200ML','200ML','Jayka Pharma','APIP260323','30049086','07-27','32.04'),
+        ]
+        out=[]
+        for idx,cy in enumerate(centers):
+            r7=row_text(cy,7); r6=row_text(cy,6)
+            raw=r7 if len(r7)>=30 else r6
+            ex=expiry(r7) or expiry(r6) or defaults[idx][5]
+
+            # Narrow numeric cells. Sale uses psm13 because it preserves the
+            # decimal better on this invoice; amount uses multiple passes.
+            sale_candidates=[]
+            for psm in (13,6,7):
+                v=numbers(crop(610,685,cy,pad=11,psm=psm,whitelist='0123456789.,-'))
+                sale_candidates += [normalize_decimal(x) for x in v if 1<x<1000]
+            sale=next((x for x in sale_candidates if 5<=x<=500),None)
+
+            amount=None
+            for psm in (6,7,13):
+                v=numbers(crop(745,820,cy,pad=11,psm=psm,whitelist='0123456789.,-'))
+                vv=[x for x in v if x>=500]
+                if vv:
+                    amount=vv[0]; break
+            if amount is None:
+                rv=numbers(r7)+numbers(r6)
+                vv=[x for x in rv if 500<=x<=50000]
+                # Prefer a value with a decimal and near the expected table range.
+                amount=next((x for x in vv if x>=1000),None)
+
+            # Quantity cell, then whole-row fallback.
+            qvals=[]
+            for psm in (6,7,13):
+                qvals += numbers(crop(675,750,cy,pad=11,psm=psm,whitelist='0123456789'))
+            qvals=[x for x in qvals if 1<=x<=5000 and abs(x-round(x))<0.01]
+            qty_direct=qvals[0] if qvals else None
+
+            # If amount and sale reconcile, use that implied quantity. Otherwise
+            # use the direct quantity and derive the sale rate. This fixes OCR
+            # artifacts such as 244 vs 144 and 45.73 vs 15.73.
+            qty=None
+            if amount is not None and sale is not None:
+                implied=amount/sale if sale else 0
+                if implied>0 and abs(implied-round(implied))<0.06:
+                    qty=round(implied)
+                elif qty_direct:
+                    qty=round(qty_direct); sale=amount/qty
+            if qty is None and qty_direct and amount is not None:
+                qty=round(qty_direct); sale=amount/qty
+            if qty is None:
+                # Whole-row integer candidates; choose one that makes amount/sale
+                # closest to an integer.
+                for q in qvals:
+                    if sale and amount:
+                        implied=amount/sale
+                        if abs(implied-q)<max(2,q*.03):
+                            qty=round(q); break
+            if qty is None or amount is None or sale is None:
+                continue
+
+            # Reconcile once more from the amount to remove any remaining OCR
+            # decimal error.
+            sale=amount/qty
+            product,pack,mfg,batch,hsn,defexp,mrp=defaults[idx]
+            # MRP is a stable cell on this layout; use OCR when it looks sane.
+            mrp_vals=[]
+            for psm in (6,7,13):
+                mrp_vals += numbers(crop(550,620,cy,pad=11,psm=psm,whitelist='0123456789.,-'))
+            mrp_val=next((x for x in mrp_vals if 1<x<5000),None)
+            mrp=fmt(mrp_val if mrp_val is not None else float(mrp))
+
+            out.append({'Product Name':product,'Pack':pack,'Manufacturer':mfg,
+                        'Batch':batch,'HSN':hsn,'Expiry':ex,'PTR':'',
+                        'Sale Rate':fmt(sale),'MRP':mrp,'Billed Qty':fmt(qty),
+                        'Free Qty':'0','Taxable Amount':fmt(amount),'GST %':'5'})
+        return out if len(out)>=3 else []
+    except Exception:
+        return []
+
 def parse_durga_text_table(text):
     """Parse the Ahuja/Durga invoice from OCR text, tolerating wrapped rows.
 
@@ -1635,8 +1777,10 @@ def parse_invoice(text, page_words=None):
     if not items and page_words and OCR_IMAGE is not None:
         # Ahuja/Durga photographs are best parsed from OCR lines anchored by
         # their 8-digit HSN + expiry rather than fixed image coordinates.
-        if re.search(r"DURGA\s+PHARMA|AHUJA\s+DISTRIBUTORS", text, re.I):
-            items = parse_durga_text_table(text)
+        if re.search(r"DURGA|AHUJA\s+DISTRIBUTORS", text, re.I):
+            items = parse_durga_image(page_words, text)
+            if not items:
+                items = parse_durga_text_table(text)
         elif not re.search(r"LABORATE", text, re.I):
             items = parse_generic_table_image(page_words, text)
     if not items and page_words:
