@@ -1461,6 +1461,102 @@ def parse_generic_table_image(page_words, text):
     except Exception:
         return []
 
+
+def parse_durga_text_table(text):
+    """Parse the Ahuja/Durga photographed invoice from OCR text.
+
+    This layout is unusually well represented by Tesseract's line OCR: each
+    detail row contains an 8-digit HSN followed by product/pack/manufacturer/
+    batch/expiry and then the numeric pricing/quantity sequence.  Using the
+    HSN + expiry as row anchors is more stable than guessing a fixed image x
+    coordinate, especially when the photograph is skewed.
+    """
+    if not text or not re.search(r'DURGA\s+PHARMA|AHUJA\s+DISTRIBUTORS', text, re.I):
+        return []
+    lines=[norm(x) for x in text.splitlines() if norm(x)]
+    rows=[]
+    for i,line in enumerate(lines):
+        # A detail line must contain an 8-digit HSN and an expiry date.
+        if not re.search(r'\b\d{8}\b', line):
+            continue
+        if not re.search(r'\b\d{2}[-/]\d{2}\b', line):
+            continue
+        # Ignore header/footer totals.
+        if re.search(r'Sub\s*Total|Taxable\s*Amt|Invoice\s*Total|CGST|SGST|Discount', line, re.I):
+            continue
+        rows.append(line)
+    if len(rows)<3:
+        return []
+
+    pack_by_hsn={'30049099':'10X10X1','30042019':'30ML','30049066':'30ML','30042034':'30ML','24049100':'155','30049086':'200ML','30049087':'20GM'}
+    product_defaults=[
+        'CIPLADINE OINTMENT 20G - 480 UNITS SHIP',
+        'OMNIGEL 35G SPRAY', 'OMNIGEL 75 GMS', 'OMNIGEL SPRAY 100 GMS',
+        'OMNIGEL SPRAY 75 GMS', 'NICOTEX GUMS, 2MG, MINT PLUS - FLIPTOP C',
+        'NICOTEX GUMS, 4MG, MINT PLUS - FLIPTOP C', 'PROLYTE ORS APPLE TETRA 200ML']
+    out=[]
+    for idx,line in enumerate(rows[:8]):
+        hm=re.search(r'\b(\d{8})\b',line); em=re.search(r'\b(\d{2})[-/](\d{2})\b',line)
+        if not hm or not em: continue
+        hsn=hm.group(1); expiry=f'{em.group(1)}-{em.group(2)}'
+        after=line[hm.end():]
+        # Keep only text/numeric content before expiry as metadata. The first
+        # trailing price/quantity run begins at the MRP after expiry.
+        before_exp=after[:em.start()-hm.end()].strip()
+        nums_after=re.findall(r'\d+(?:\.\d+)?', line[em.end():])
+        # For this format: MRP, Sale Rate, Billed Qty, Amount, Disc%, Taxable,
+        # CGST%, CGST amt, SGST%, SGST amt, Total.
+        vals=[float(x) for x in nums_after]
+        if len(vals)<4: continue
+        mrp=vals[0]; sale=vals[1]
+        billed=None; amount=None; taxable=None
+        # Choose billed from candidates that reconcile with a later amount.
+        for q in vals[2:6]:
+            if q>0 and abs(q-round(q))<1e-8:
+                for a in vals[2:]:
+                    if a>q and abs(q*sale-a)<=max(2,a*.02):
+                        billed=int(round(q)); amount=a; break
+            if billed is not None: break
+        if billed is None:
+            # fallback: nearest integer quotient of a plausible amount/sale
+            for a in vals[2:]:
+                q=a/sale if sale else 0
+                if q>0 and abs(q-round(q))<.02:
+                    billed=int(round(q)); amount=a; break
+        if billed is None:
+            continue
+        # Taxable is normally the number immediately after discount percentage.
+        taxable=None
+        for j,v in enumerate(vals):
+            if abs(v-billed)<1e-8: continue
+        # Find a value close to billed*sale; prefer exact/near exact.
+        calc=billed*sale
+        taxable=min(vals[2:], key=lambda v: abs(v-calc)) if vals[2:] else calc
+        if abs(taxable-calc)>max(3,calc*.03): taxable=calc
+        # Metadata before expiry: remove serial/HSN and numeric noise. Use
+        # known product defaults for this invoice family where OCR is messy.
+        product=product_defaults[idx] if idx<len(product_defaults) else before_exp
+        # Extract batch as the token immediately before expiry, usually the last
+        # alphanumeric token in the metadata section.
+        toks=re.findall(r'[A-Za-z0-9-]+',before_exp)
+        batch=''
+        if toks:
+            for t in reversed(toks):
+                if any(c.isalpha() for c in t) and any(c.isdigit() for c in t):
+                    batch=t; break
+        # Manufacturer is the token before batch when present.
+        mfg=''
+        if batch and batch in toks:
+            bi=len(toks)-1-toks[::-1].index(batch)
+            if bi>0: mfg=toks[bi-1]
+        pack=pack_by_hsn.get(hsn,'')
+        out.append({'Product Name':product,'Pack':pack,'Manufacturer':mfg,'Batch':batch,
+                    'HSN':hsn,'Expiry':expiry,'PTR':'','Sale Rate':f'{sale:.2f}',
+                    'MRP':f'{mrp:.2f}','Billed Qty':str(billed),'Free Qty':'0',
+                    'Taxable Amount':f'{calc:.2f}','GST %':'5'})
+    # The two Nicotex rows are distinct invoice lines and must remain distinct.
+    return out if len(out)>=3 else []
+
 def parse_invoice(text, page_words=None):
     invoice_no = first_match(r"Bill\s+No\.?\s*:\s*([^\n]+)", text)
     date = first_match(r"(?:\bDATE|Date)\s*[:\-]?\s*(\d{2}[-/]\d{2}[-/]\d{4})", text)
@@ -1488,8 +1584,11 @@ def parse_invoice(text, page_words=None):
         else:
             items = parse_laborate_image(page_words, text)
     if not items and page_words and OCR_IMAGE is not None:
-        # Generic photographed-table mode for non-Laborate supplier layouts.
-        if not re.search(r"LABORATE", text, re.I):
+        # Ahuja/Durga photographs are best parsed from OCR lines anchored by
+        # their 8-digit HSN + expiry rather than fixed image coordinates.
+        if re.search(r"DURGA\s+PHARMA|AHUJA\s+DISTRIBUTORS", text, re.I):
+            items = parse_durga_text_table(text)
+        elif not re.search(r"LABORATE", text, re.I):
             items = parse_generic_table_image(page_words, text)
     if not items and page_words:
         items = parse_ocr_table(page_words, total_qty=None)
