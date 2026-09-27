@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="SWIL Invoice → CSV", page_icon="🧾", layout="wide")
+st.set_page_config(page_title="SWIL Invoice → CSV v33", page_icon="🧾", layout="wide")
 st.title("🧾 SWIL Invoice → CSV")
 st.caption("Upload a supplier invoice PDF/JPG/PNG, review the extracted items, and export a SWIL CSV using the exact 38-column structure of the known-good working file.")
 
@@ -315,88 +315,6 @@ def parse_header_driven_table(page_words):
     return unique
 
 
-
-def parse_yash_pharma(page_words):
-    """Parse YASH PHARMA / MARG-style native PDF tables by fixed visual bands.
-
-    This supplier's PDF has a clean, single-line 18-row table.  The generic
-    header-driven parser can misidentify the tightly packed columns, so use the
-    actual printed column boundaries from this layout.
-    """
-    items = []
-    for words in page_words or []:
-        # The table header is around y=244 and the numbered rows start around
-        # y=263. Rows are approximately 10.1 points apart on this invoice.
-        anchors = []
-        for w in words:
-            x0, y0, x1, y1, t, *_ = w
-            token = str(t).strip()
-            yc = (y0 + y1) / 2
-            if x0 < 35 and yc > 250 and re.fullmatch(r"\d+\.", token):
-                anchors.append((int(token[:-1]), yc))
-        anchors.sort(key=lambda z: z[1])
-        # Keep the numbered sequence, including all rows through the final row.
-        if not anchors:
-            continue
-
-        for idx, (sr, y) in enumerate(anchors):
-            # Narrow row band: adjacent rows are ~10 points apart.
-            lo = y - 4.5
-            hi = (y + anchors[idx + 1][1]) / 2 if idx + 1 < len(anchors) else y + 5.0
-            row = [w for w in words if lo <= (w[1] + w[3]) / 2 < hi]
-
-            def band(left, right):
-                vals = []
-                for w in row:
-                    x0, y0, x1, y1, t, *_ = w
-                    if left <= x0 < right:
-                        vals.append((x0, str(t)))
-                return norm(" ".join(t for _, t in sorted(vals)))
-
-            product = band(35, 148)
-            manufacturer = band(145, 178)
-            hsn = band(178, 210)
-            pack = band(210, 248)
-            batch = band(248, 297)
-            expiry = band(297, 326)
-            billed = band(326, 349)
-            free = band(349, 373)
-            mrp = band(373, 410)
-            pts = band(410, 439)       # P.T.S. / purchase price
-            rate = band(439, 469)      # N.RATE / net rate
-            discount = band(469, 492)
-            sgst = band(492, 518)
-            cgst = band(518, 541)
-            amount = band(541, 590)
-
-            if not product or not re.fullmatch(r"\d{8}", re.sub(r"\D", "", hsn)):
-                continue
-
-            hsn = re.sub(r"\D", "", hsn)
-            try:
-                gst = f"{float(re.sub(r'[^0-9.]', '', sgst) or 0) + float(re.sub(r'[^0-9.]', '', cgst) or 0):g}"
-                if gst == "0":
-                    gst = "5"
-            except ValueError:
-                gst = "5"
-
-            items.append({
-                "Product Name": product,
-                "Pack": pack,
-                "Manufacturer": manufacturer,
-                "Batch": batch,
-                "HSN": hsn,
-                "Expiry": expiry,
-                "PTR": pts,
-                "Sale Rate": rate,
-                "MRP": mrp,
-                "Billed Qty": billed,
-                "Free Qty": free,
-                "Taxable Amount": amount,
-                "GST %": gst,
-            })
-    return items
-
 def parse_arjav_style(page_words):
     """Parse the Arjav Pharma invoice table using fixed visual column bands."""
     items = []
@@ -551,12 +469,8 @@ def parse_invoice(text, page_words=None):
 
     eway = first_match(r"E\.Way\s+Bill\s*\n?\s*No\.\s*&\s*Date\s*\n?\s*([0-9]+)", text)
 
-    # Supplier-specific native-PDF parser first for YASH PHARMA.
-    if re.search(r"YASH\s+PHARMA", text, re.I) and page_words:
-        items = parse_yash_pharma(page_words)
-    else:
-        # Discover the invoice table from the printed column headers first.
-        items = parse_header_driven_table(page_words) if page_words else []
+    # Discover the invoice table from the printed column headers first.
+    items = parse_header_driven_table(page_words) if page_words else []
 
     # Existing supplier-specific parsers remain as fallbacks.
     if not items and re.search(r"ARJAV PHARMA", text, re.I) and page_words:
@@ -600,19 +514,13 @@ def read_template(uploaded):
 
 
 def swil_csv(template_rows, meta, items):
-    """Generate the CSV according to the user's actual MargNewCSV import definition.
+    """Generate the proven 38-column SWIL import structure.
 
-    Source of truth: the supplied SWIL/MARG XML definition.  SWIL maps only
-    specific fields for H, T and F records.  We retain the proven 38-column
-    physical layout, but only populate fields that are defined by that mapping.
+    This follows the field positions of the known-good SWIL_MDl001161_trimmed.csv.
+    HSN is deliberately not written to the item row because the physical export
+    ends at MARGID (column 38). MARGID stays blank.
     """
-    def clean_date(v):
-        s = str(v or '').strip()
-        # Invoice date: DDMMYYYY.  Also accept DD-MM-YYYY / DD/MM/YYYY.
-        m = re.fullmatch(r'(\d{2})[-/]?(\d{2})[-/]?(\d{4})', s)
-        if m:
-            return ''.join(m.groups())
-        return s.replace('-', '').replace('/', '')
+    WIDTH = 38
 
     def num(v):
         try:
@@ -620,78 +528,90 @@ def swil_csv(template_rows, meta, items):
         except Exception:
             return 0.0
 
-    def fmt_num(v, decimals=2):
+    def fmt(v):
         x = num(v)
         if abs(x - round(x)) < 1e-9:
             return str(int(round(x)))
-        return f"{x:.{decimals}f}"
+        return f"{x:.2f}"
 
-    def expiry_ddmmyyyy(v):
+    def clean_date(v):
         s = str(v or '').strip()
-        # Common invoice expiry forms: MM-YY, MM/YYYY, MMYY, MM-YYYY.
+        m = re.fullmatch(r'(\d{2})[-/]?(\d{2})[-/]?(\d{4})', s)
+        return ''.join(m.groups()) if m else s.replace('-', '').replace('/', '')
+
+    def expiry(v):
+        s = str(v or '').strip()
         m = re.fullmatch(r'(\d{1,2})[-/]?(\d{2}|\d{4})', s)
         if m:
-            month = int(m.group(1))
-            year = int(m.group(2))
-            if year < 100:
-                year += 2000
-            if 1 <= month <= 12:
-                return f"01{month:02d}{year:04d}"
-        # Already DDMMYYYY.
-        m = re.fullmatch(r'\d{8}', s)
-        return s if m else s.replace('-', '').replace('/', '')
-
-    # Always use 38 columns, matching the proven import file.  The XML
-    # definition itself only maps positions 0..22 for the fields we need.
-    WIDTH = 38
-    out = []
+            mm, yy = int(m.group(1)), int(m.group(2))
+            if yy < 100:
+                yy += 2000
+            if 1 <= mm <= 12:
+                return f"01{mm:02d}{yy:04d}"
+        if re.fullmatch(r'\d{8}', s):
+            return s
+        return s.replace('-', '').replace('/', '')
 
     invoice_no = str(meta.get('invoice_no', '') or '').strip()
     invoice_date = clean_date(meta.get('date', ''))
 
-    # H: A=Type, C=Invoice Number, D=Invoice Date.
+    # Exact header shape from the known-good 38-column import file.
     h = [''] * WIDTH
-    h[0] = 'H'
-    h[2] = invoice_no
-    h[3] = invoice_date
-    out.append(h)
+    h[0] = 'H'; h[1] = '1'; h[2] = invoice_no; h[3] = invoice_date
+    h[5] = '00000000'; h[7] = '1'; h[9] = invoice_date; h[10] = 'AHUJA'
+    h[12] = invoice_date; h[13] = '23-MADHYA PRADE'; h[14] = '8'; h[15] = '0'
+    h[17] = '0'; h[26] = 'S'; h[28] = 'ATGA'
+    h[30] = 'AHUJA DISTRIBUTORS JABALPUR (M.P)'; h[31] = '8411055776'
+    h[32] = '23ANXPA5038Q1ZG'
 
-    # T: A=Type, C=Company Name, F=Product, G=Pack, I=Batch,
-    # J=Expiry (DDMMYYYY), O=PTS without tax, Q=MRP, U=Qty,
-    # V=Free Qty, W=PTR Discount %.
+    total = num(meta.get('invoice_total', ''))
+    taxable_total = sum(num(x.get('Taxable Amount', '')) for x in items)
+    cgst_total = sum(num(x.get('Taxable Amount', '')) * num(x.get('GST %', '')) / 2 / 100 for x in items)
+    if not total:
+        total = taxable_total + (2 * cgst_total)
+
+    # Preserve the proven internal SWIL header string while replacing the
+    # invoice-specific total/taxable/CGST values.
+    h[33] = (f'N24.00 2.0030 0.00 0   0.00#  0.00R0:0:0          NN1T      '
+             f'0.00NAN  {total:.2f}#Y  0Y  {taxable_total:.2f}  N MZ  '
+             f'{taxable_total:.2f}   {cgst_total:.2f}      0.00      0.00N     0.00      0.00      0.00')
+    h[34] = 'ZYNYNGANNN1N1INN M'; h[35] = 'M '; h[36] = '2'
+    h[37] = 'PLOT NO.131/6,S-3,SHOP NO.03,BASMENT AND GROUND MEDICINE COMPLEX NAPIER TOWN'
+
+    out = [h]
     for item in items:
         r = [''] * WIDTH
-        r[0] = 'T'
         company = str(item.get('Manufacturer', '') or '').strip()
-        # The supplied definition maps Company Name to C (index 2).
-        # Manufacturer is not a mapped field, so do not put it in B.
+        r[0] = 'T'
+        # Proven file stores the manufacturer/company in both B and C.
+        r[1] = company
         r[2] = company
         r[5] = str(item.get('Product Name', '') or '').strip()
         r[6] = str(item.get('Pack', '') or '').strip()
         r[8] = str(item.get('Batch', '') or '').strip()
-        r[9] = expiry_ddmmyyyy(item.get('Expiry', ''))
-        r[14] = fmt_num(item.get('PTR', ''))
-        r[16] = fmt_num(item.get('MRP', ''))
-        r[20] = fmt_num(item.get('Billed Qty', ''))
-        r[21] = fmt_num(item.get('Free Qty', ''))
-        r[22] = fmt_num(item.get('PTR Discount %', '0'))
+        r[9] = expiry(item.get('Expiry', ''))
+        gst = num(item.get('GST %', '')) or 5.0
+        taxable = num(item.get('Taxable Amount', ''))
+        cgst = taxable * gst / 2 / 100
+        r[12] = fmt(gst)
+        r[13] = '0'
+        # The proven SWIL file places Sale Rate in column O (index 14), not PTR.
+        r[14] = fmt(item.get('Sale Rate', '') or item.get('PTR', ''))
+        r[15] = '0.00'
+        r[16] = fmt(item.get('MRP', ''))
+        r[18] = '0'
+        r[20] = fmt(item.get('Billed Qty', ''))
+        r[21] = fmt(item.get('Free Qty', ''))
+        r[22] = '0'; r[23] = '0'; r[24] = '0'
+        r[25] = fmt(taxable)
+        r[26] = fmt(cgst)
+        r[27] = '0'; r[28] = '0'; r[29] = 'G'
+        # Index 36 = blank; index 37 = MARGID, deliberately blank.
         out.append(r)
 
-    # F: A=Type, B=Total Gross Amount, C=PTR Discount Amount.
-    # Prefer the invoice total if extracted; otherwise sum taxable + GST.
-    invoice_total = num(meta.get('invoice_total', ''))
-    if not invoice_total:
-        invoice_total = sum(
-            num(x.get('Taxable Amount', '')) * (1 + num(x.get('GST %', '')) / 100)
-            for x in items
-        )
-    ptr_discount = sum(
-        num(x.get('PTR Discount Amount', '')) for x in items
-    )
+    # Proven footer shape: total at B, CGST total at J.
     f = [''] * WIDTH
-    f[0] = 'F'
-    f[1] = f"{invoice_total:.2f}"
-    f[2] = f"{ptr_discount:.2f}"
+    f[0] = 'F'; f[1] = fmt(total); f[2] = '0.00'; f[3] = '0'; f[4] = '0'; f[5] = '0'; f[6] = '0'; f[8] = '0'; f[9] = fmt(cgst_total)
     out.append(f)
     return out
 
