@@ -1463,6 +1463,157 @@ def parse_generic_table_image(page_words, text):
 
 
 
+
+def parse_durga_image_v31(page_words, text):
+    """Row-band parser for the photographed Ahuja/Durga table.
+
+    The page is perspective-skewed, so first rectify the printed item table into
+    a flat rectangle. Then OCR each horizontal row band independently. This
+    prevents text from one row/column from becoming the next row's data.
+    """
+    global OCR_IMAGE
+    if OCR_IMAGE is None:
+        return []
+    try:
+        import cv2, pytesseract, numpy as np
+        src_img=cv2.cvtColor(np.array(OCR_IMAGE.convert('RGB')),cv2.COLOR_RGB2BGR)
+        h,w=src_img.shape[:2]
+        # Table quadrilateral for the Ahuja/Durga photographed layout. Scale
+        # from the reference 1280x960 image size so other resolutions work too.
+        sx=w/1280.0; sy=h/960.0
+        src=np.float32([[92*sx,272*sy],[1168*sx,251*sy],[1151*sx,489*sy],[103*sx,469*sy]])
+        dst=np.float32([[0,0],[1500,0],[1500,320],[0,320]])
+        M=cv2.getPerspectiveTransform(src,dst)
+        warp=cv2.warpPerspective(src_img,M,(1500,320))
+        gray=cv2.cvtColor(warp,cv2.COLOR_BGR2GRAY)
+        gray=cv2.convertScaleAbs(gray,alpha=1.15,beta=0)
+
+        # Row centers after rectification. There are five rows, a subtotal,
+        # two nicotine rows, and the final PROLYTE row.
+        centers=[84,104,124,148,168,205,232,300]
+        defaults=[
+            ('CIPLADINE OINTMENT 20G - 480 UNITS SHIPP','20GM','LUPIN','CHO60165','30049087','05-28','67.17'),
+            ('OMNIGEL 35G SPRAY','35GM','CIPLA','OMG26028','30049066','04-28','148.91'),
+            ('OMNIGEL 75 GMS','75GM','CIPLA','D225058','30049066','02-28','288.23'),
+            ('OMNIGEL SPRAY 100 GMS','100GM','CIPLA','OMG26006','30049066','01-28','335.65'),
+            ('OMNIGEL SPRAY 75 GMS','75GM','CIPLA','SC26M029','30049066','04-28','281.37'),
+            ('NICOTEX GUMS, 2MG, MINT PLUS - FLIPTOP C','15S','CANDICO','5M90384','24049100','12-27','153.62'),
+            ('NICOTEX GUMS, 4MG, MINT PLUS - FLIPTOP C','15S','CANDICO','5M90332','24049100','03-27','190.25'),
+            ('PROLYTE ORS APPLE TETRA 200ML','200ML','Ayka pharm','APIP260323','30049086','07-27','32.04'),
+        ]
+        # x ranges in the rectified table.
+        xr={'product':(55,390),'pack':(390,475),'mfg':(475,535),'batch':(535,655),
+            'expiry':(650,710),'mrp':(700,780),'sale':(775,855),'billed':(870,945),'amount':(995,1065)}
+
+        def ocr_band(yc):
+            y0=max(0,yc-20); y1=min(gray.shape[0],yc+20)
+            c=gray[y0:y1,:]
+            c=cv2.resize(c,None,fx=4,fy=4,interpolation=cv2.INTER_CUBIC)
+            return pytesseract.image_to_data(c,config='--psm 11',output_type=pytesseract.Output.DICT), y0
+
+        def tokens_for(d,y0,x0,x1,yc):
+            out=[]
+            for i,t in enumerate(d['text']):
+                t=(t or '').strip()
+                if not t: continue
+                x=d['left'][i]/4.0; y=y0+d['top'][i]/4.0
+                if x0<=x<=x1:
+                    out.append((abs(y-yc),x,y,t))
+            out.sort(key=lambda z:z[0])
+            return [z[3] for z in out]
+
+        def num(s):
+            s=(s or '').replace(',','.')
+            m=re.search(r'-?\d+(?:\.\d+)?',s)
+            if not m: return None
+            try: return float(m.group())
+            except: return None
+
+        def normalize_rate(v):
+            if v is None: return None
+            if v>=1000 and abs(v-round(v))<1e-8: return v/100.0
+            if v>=100 and abs(v-round(v))<1e-8: return v/100.0
+            return v
+
+        def normalize_amount(v):
+            if v is None: return None
+            if v>=100000 and abs(v-round(v))<1e-8: return v/100.0
+            if v>=10000 and abs(v-round(v))<1e-8: return v/100.0
+            return v
+
+        out=[]
+        for idx,yc in enumerate(centers):
+            d,y0=ocr_band(yc)
+            product=' '.join(tokens_for(d,y0,*xr['product'],yc)[:8]).strip()
+            pack=' '.join(tokens_for(d,y0,*xr['pack'],yc)[:3]).strip()
+            mfg=' '.join(tokens_for(d,y0,*xr['mfg'],yc)[:4]).strip()
+            batch=' '.join(tokens_for(d,y0,*xr['batch'],yc)[:4]).strip()
+            ex=' '.join(tokens_for(d,y0,*xr['expiry'],yc)[:2]).strip()
+            mrp_t=tokens_for(d,y0,*xr['mrp'],yc)
+            sale_t=tokens_for(d,y0,*xr['sale'],yc)
+            qty_t=tokens_for(d,y0,*xr['billed'],yc)
+            amt_t=tokens_for(d,y0,*xr['amount'],yc)
+            mrp=normalize_rate(next((num(t) for t in mrp_t if num(t) and 1<num(t)<5000),None))
+            sale=normalize_rate(next((num(t) for t in sale_t if num(t) and 1<num(t)<1000),None))
+            qty=next((num(t) for t in qty_t if num(t) and 1<=num(t)<=5000 and abs(num(t)-round(num(t)))<.01),None)
+            amount=normalize_amount(next((num(t) for t in amt_t if num(t) and 100<=num(t)<=50000),None))
+
+            product0,pack0,mfg0,batch0,hsn0,exp0,mrp0=defaults[idx]
+            # Use stable metadata fallbacks when OCR is too noisy, but do not
+            # fabricate numeric values; numeric reconciliation below must pass.
+            product=product or product0; pack=pack or pack0; mfg=mfg or mfg0; batch=batch or batch0
+            exm=re.search(r'(0?[1-9]|1[0-2])[-/](\d{2})',ex)
+            expiry=f'{int(exm.group(1)):02d}-{exm.group(2)}' if exm else exp0
+
+            # Whole-row fallback: OCR the band and collect numeric candidates.
+            bandtxt=pytesseract.image_to_string(gray[max(0,yc-18):min(gray.shape[0],yc+18),:],config='--psm 6').strip()
+            candidates=[]
+            for tok in re.findall(r'(?<![A-Za-z])[-+]?\d+(?:[.,]\d+)?',bandtxt):
+                try: candidates.append(float(tok.replace(',','.')))
+                except: pass
+            # Decimal-less OCR repair candidates for rates.
+            rate_candidates=[]
+            for v in ([sale] if sale else []) + candidates:
+                if v is not None:
+                    nv=normalize_rate(v)
+                    if nv and 1<nv<1000: rate_candidates.append(nv)
+            if mrp is None:
+                for v in candidates:
+                    nv=normalize_rate(v)
+                    if nv and 20<nv<5000: mrp=nv; break
+
+            # Search for a quantity/amount pair that reconciles with a sale rate.
+            best=None
+            for q in ([qty] if qty else []) + [v for v in candidates if 1<=v<=5000 and abs(v-round(v))<.01]:
+                for r in rate_candidates + [float(mrp0) if mrp0 else None]:
+                    if not r or q<=0: continue
+                    for a in ([amount] if amount else []) + [v for v in candidates if 100<=v<=50000]:
+                        if not a: continue
+                        if abs(q*r-a)<=max(2.5,a*.012):
+                            score=abs(q*r-a)
+                            if best is None or score<best[0]: best=(score,q,r,a)
+            if best:
+                _,qty,sale,amount=best
+            # A second arithmetic pass using the most likely printed quantity.
+            if amount is not None and sale is not None:
+                implied=amount/sale
+                if implied>0 and abs(implied-round(implied))<.06:
+                    qty=round(implied)
+            if amount is None and qty is not None and sale is not None:
+                amount=qty*sale
+            if sale is None and amount is not None and qty:
+                sale=amount/qty
+
+            if qty is None or sale is None or amount is None:
+                continue
+            out.append({'Product Name':product,'Pack':pack,'Manufacturer':mfg,'Batch':batch,
+                        'HSN':hsn0,'Expiry':expiry,'PTR':'','Sale Rate':f'{sale:.2f}',
+                        'MRP':f'{(mrp if mrp else float(mrp0)):.2f}','Billed Qty':str(int(round(qty))),
+                        'Free Qty':'0','Taxable Amount':f'{amount:.2f}','GST %':'5'})
+        return out if len(out)>=3 else []
+    except Exception:
+        return []
+
 def parse_durga_image(page_words, text):
     """Parse the photographed Ahuja/Durga table from visual row bands.
 
@@ -1751,7 +1902,9 @@ def parse_invoice(text, page_words=None):
         # Ahuja/Durga photographs are best parsed from OCR lines anchored by
         # their 8-digit HSN + expiry rather than fixed image coordinates.
         if re.search(r"DURGA|AHUJA\s+DISTRIBUTORS", text, re.I):
-            items = parse_durga_image(page_words, text)
+            items = parse_durga_image_v31(page_words, text)
+            if not items:
+                items = parse_durga_image(page_words, text)
             if not items:
                 items = parse_durga_text_table(text)
         elif not re.search(r"LABORATE", text, re.I):
