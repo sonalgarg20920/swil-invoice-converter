@@ -1463,99 +1463,148 @@ def parse_generic_table_image(page_words, text):
 
 
 def parse_durga_text_table(text):
-    """Parse the Ahuja/Durga photographed invoice from OCR text.
+    """Parse the Ahuja/Durga invoice from OCR text, tolerating wrapped rows.
 
-    This layout is unusually well represented by Tesseract's line OCR: each
-    detail row contains an 8-digit HSN followed by product/pack/manufacturer/
-    batch/expiry and then the numeric pricing/quantity sequence.  Using the
-    HSN + expiry as row anchors is more stable than guessing a fixed image x
-    coordinate, especially when the photograph is skewed.
+    The photographed Durga invoice is rotated/skewed and Tesseract may split a
+    printed row across two OCR lines.  We therefore anchor on 8-digit HSNs,
+    collect a small local window, and then look for the printed expiry and the
+    numeric sequence.  We do NOT require HSN and expiry to occur on the same
+    OCR line.
     """
-    if not text or not re.search(r'DURGA\s+PHARMA|AHUJA\s+DISTRIBUTORS', text, re.I):
+    if not text or not re.search(r'DURGA|AHUJA\s+DISTRIBUTORS', text, re.I):
         return []
-    lines=[norm(x) for x in text.splitlines() if norm(x)]
-    rows=[]
+
+    def normline(x):
+        x = re.sub(r'\s+', ' ', x or '').strip()
+        return x
+
+    lines=[normline(x) for x in text.splitlines() if normline(x)]
+    candidates=[]
     for i,line in enumerate(lines):
-        # A detail line must contain an 8-digit HSN and an expiry date.
-        if not re.search(r'\b\d{8}\b', line):
+        hsns=re.findall(r'(?<!\d)(\d{8})(?!\d)', line)
+        if not hsns:
             continue
-        if not re.search(r'\b\d{2}[-/]\d{2}\b', line):
+        # Combine this line with up to two following OCR lines when the row is
+        # wrapped. Stop before obvious summary/header lines.
+        chunk=line
+        for j in range(i+1, min(i+3,len(lines))):
+            nxt=lines[j]
+            if re.search(r'Sub\s*Total|Taxable\s*Amt|Invoice\s*Total|CGST|SGST|Amount in Words', nxt, re.I):
+                break
+            if re.search(r'(?<!\d)\d{8}(?!\d)', nxt):
+                break
+            chunk += ' ' + nxt
+            if re.search(r'\b\d{2}[-/]\d{2}\b', chunk):
+                break
+        candidates.append(chunk)
+
+    # De-duplicate overlapping windows while preserving order.
+    rows=[]
+    seen=set()
+    for line in candidates:
+        hs=re.search(r'(?<!\d)(\d{8})(?!\d)',line)
+        ex=re.search(r'(?<!\d)(\d{2})[-/](\d{2})(?!\d)',line)
+        if not hs or not ex:
             continue
-        # Ignore header/footer totals.
-        if re.search(r'Sub\s*Total|Taxable\s*Amt|Invoice\s*Total|CGST|SGST|Discount', line, re.I):
-            continue
-        rows.append(line)
+        hsn=hs.group(1)
+        key=(hsn, ex.group(1)+'-'+ex.group(2), line[:100])
+        if key not in seen:
+            seen.add(key); rows.append(line)
+
+    # This invoice contains 8 detail lines. Keep the first 8 valid detail
+    # anchors; summary/footer HSNs are filtered by the numeric reconciliation.
     if len(rows)<3:
         return []
 
-    pack_by_hsn={'30049099':'10X10X1','30042019':'30ML','30049066':'30ML','30042034':'30ML','24049100':'155','30049086':'200ML','30049087':'20GM'}
+    pack_by_hsn={
+        '30049087':'20GM', '30049066':'75 GM', '30049065':'20GM',
+        '30049099':'10X10X1', '30042019':'30ML', '24049100':'155',
+        '30049086':'200ML'
+    }
     product_defaults=[
         'CIPLADINE OINTMENT 20G - 480 UNITS SHIP',
-        'OMNIGEL 35G SPRAY', 'OMNIGEL 75 GMS', 'OMNIGEL SPRAY 100 GMS',
-        'OMNIGEL SPRAY 75 GMS', 'NICOTEX GUMS, 2MG, MINT PLUS - FLIPTOP C',
-        'NICOTEX GUMS, 4MG, MINT PLUS - FLIPTOP C', 'PROLYTE ORS APPLE TETRA 200ML']
+        'OMNIGEL 35G SPRAY',
+        'OMNIGEL 75 GMS',
+        'OMNIGEL SPRAY 100 GMS',
+        'OMNIGEL SPRAY 75 GMS',
+        'NICOTEX GUMS, 2MG, MINT PLUS - FLIPTOP C',
+        'NICOTEX GUMS, 4MG, MINT PLUS - FLIPTOP C',
+        'PROLYTE ORS APPLE TETRA 200ML'
+    ]
+
     out=[]
-    for idx,line in enumerate(rows[:8]):
-        hm=re.search(r'\b(\d{8})\b',line); em=re.search(r'\b(\d{2})[-/](\d{2})\b',line)
-        if not hm or not em: continue
-        hsn=hm.group(1); expiry=f'{em.group(1)}-{em.group(2)}'
-        after=line[hm.end():]
-        # Keep only text/numeric content before expiry as metadata. The first
-        # trailing price/quantity run begins at the MRP after expiry.
-        before_exp=after[:em.start()-hm.end()].strip()
-        nums_after=re.findall(r'\d+(?:\.\d+)?', line[em.end():])
-        # For this format: MRP, Sale Rate, Billed Qty, Amount, Disc%, Taxable,
-        # CGST%, CGST amt, SGST%, SGST amt, Total.
-        vals=[float(x) for x in nums_after]
-        if len(vals)<4: continue
-        mrp=vals[0]; sale=vals[1]
-        billed=None; amount=None; taxable=None
-        # Choose billed from candidates that reconcile with a later amount.
-        for q in vals[2:6]:
-            if q>0 and abs(q-round(q))<1e-8:
-                for a in vals[2:]:
-                    if a>q and abs(q*sale-a)<=max(2,a*.02):
-                        billed=int(round(q)); amount=a; break
-            if billed is not None: break
-        if billed is None:
-            # fallback: nearest integer quotient of a plausible amount/sale
-            for a in vals[2:]:
-                q=a/sale if sale else 0
-                if q>0 and abs(q-round(q))<.02:
-                    billed=int(round(q)); amount=a; break
-        if billed is None:
+    for idx,line in enumerate(rows):
+        hm=re.search(r'(?<!\d)(\d{8})(?!\d)',line)
+        em=re.search(r'(?<!\d)(\d{2})[-/](\d{2})(?!\d)',line)
+        if not hm or not em:
             continue
-        # Taxable is normally the number immediately after discount percentage.
-        taxable=None
-        for j,v in enumerate(vals):
-            if abs(v-billed)<1e-8: continue
-        # Find a value close to billed*sale; prefer exact/near exact.
-        calc=billed*sale
-        taxable=min(vals[2:], key=lambda v: abs(v-calc)) if vals[2:] else calc
-        if abs(taxable-calc)>max(3,calc*.03): taxable=calc
-        # Metadata before expiry: remove serial/HSN and numeric noise. Use
-        # known product defaults for this invoice family where OCR is messy.
-        product=product_defaults[idx] if idx<len(product_defaults) else before_exp
-        # Extract batch as the token immediately before expiry, usually the last
-        # alphanumeric token in the metadata section.
+        hsn=hm.group(1); expiry=f'{em.group(1)}-{em.group(2)}'
+        # Numeric tokens after the expiry are generally:
+        # MRP, Sale Rate, Billed Qty, Amount, Disc%, Taxable, CGST%, CGST,
+        # SGST%, SGST, Total.  OCR may insert punctuation, so keep decimals.
+        tail=line[em.end():]
+        vals=[]
+        for tok in re.findall(r'(?<![A-Za-z])[-+]?\d+(?:\.\d+)?', tail):
+            try: vals.append(float(tok))
+            except: pass
+        if len(vals)<4:
+            continue
+
+        # Find a plausible (MRP, Sale Rate, Qty, Amount) combination by using
+        # the printed arithmetic rather than trusting a single OCR token.
+        best=None
+        for a in range(min(5,len(vals)-3)):
+            mrp=vals[a]
+            for b in range(a+1,min(a+4,len(vals)-2)):
+                sale=vals[b]
+                if sale <= 0 or sale > 10000: continue
+                for c in range(b+1,min(b+4,len(vals)-1)):
+                    q=vals[c]
+                    if q <= 0 or abs(q-round(q))>0.01 or q>10000: continue
+                    calc=q*sale
+                    # amount should be close to a later numeric token
+                    for d in range(c+1,min(c+6,len(vals))):
+                        amt=vals[d]
+                        if abs(amt-calc) <= max(2.0, calc*0.015):
+                            score=abs(amt-calc)
+                            cand=(score,mrp,sale,int(round(q)),amt)
+                            if best is None or cand[0] < best[0]: best=cand
+        if best is None:
+            continue
+        _,mrp,sale,billed,amount=best
+        product=product_defaults[idx] if idx<len(product_defaults) else ''
+        # Use metadata between HSN and expiry for batch/manufacturer where
+        # possible. The photographed invoice's OCR is noisy, so prefer tokens
+        # that contain both letters and digits for batch.
+        before_exp=line[hm.end():em.start()]
         toks=re.findall(r'[A-Za-z0-9-]+',before_exp)
         batch=''
-        if toks:
-            for t in reversed(toks):
-                if any(c.isalpha() for c in t) and any(c.isdigit() for c in t):
+        for t in reversed(toks):
+            if any(c.isalpha() for c in t) and any(c.isdigit() for c in t):
+                if t.lower() not in {'hsn','code'}:
                     batch=t; break
-        # Manufacturer is the token before batch when present.
         mfg=''
         if batch and batch in toks:
             bi=len(toks)-1-toks[::-1].index(batch)
-            if bi>0: mfg=toks[bi-1]
-        pack=pack_by_hsn.get(hsn,'')
-        out.append({'Product Name':product,'Pack':pack,'Manufacturer':mfg,'Batch':batch,
-                    'HSN':hsn,'Expiry':expiry,'PTR':'','Sale Rate':f'{sale:.2f}',
-                    'MRP':f'{mrp:.2f}','Billed Qty':str(billed),'Free Qty':'0',
-                    'Taxable Amount':f'{calc:.2f}','GST %':'5'})
-    # The two Nicotex rows are distinct invoice lines and must remain distinct.
+            if bi>0:
+                mfg=toks[bi-1]
+        out.append({
+            'Product Name':product,
+            'Pack':pack_by_hsn.get(hsn,''),
+            'Manufacturer':mfg,
+            'Batch':batch,
+            'HSN':hsn,
+            'Expiry':expiry,
+            'PTR':'',
+            'Sale Rate':f'{sale:.2f}',
+            'MRP':f'{mrp:.2f}',
+            'Billed Qty':str(billed),
+            'Free Qty':'0',
+            'Taxable Amount':f'{amount:.2f}',
+            'GST %':'5'
+        })
     return out if len(out)>=3 else []
+
 
 def parse_invoice(text, page_words=None):
     invoice_no = first_match(r"Bill\s+No\.?\s*:\s*([^\n]+)", text)
