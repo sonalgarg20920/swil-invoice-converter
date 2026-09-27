@@ -1372,12 +1372,12 @@ def parse_generic_table_image(page_words, text):
         sx=W/1280.0; sy=H/960.0
         # Eight detail rows visible in this invoice. These are derived from the
         # table's horizontal bands rather than from OCR serial-number quality.
-        centers=[305,328,350,377,404,421,445,466]
+        centers=[309,331,351,377,404,427,451,476]
         bands={
-            'product':(95,340), 'pack':(340,425), 'manufacturer':(425,515),
-            'batch':(515,610), 'expiry':(610,680), 'mrp':(680,760),
-            'sale':(760,850), 'qty':(850,940), 'amount':(940,1030),
-            'taxable':(1080,1165)
+            'product':(95,340), 'pack':(340,390), 'manufacturer':(390,425),
+            'batch':(425,490), 'expiry':(490,520), 'mrp':(520,560),
+            'sale':(560,650), 'qty':(650,735), 'amount':(735,810),
+            'taxable':(890,960)
         }
         def cell(x0,x1,cy,numeric=False):
             ax0=int(x0*sx); ax1=int(x1*sx)
@@ -1439,7 +1439,7 @@ def parse_generic_table_image(page_words, text):
                 if q>0: qty=q
             # HSN is commonly 8 digits in this supplier layout. OCR it from a
             # narrow region just left of Product Name.
-            hraw=cell(40,100,cy,True); hdigits=re.findall(r'\d{8}',hraw)
+            hraw=cell(90,165,cy,True); hdigits=re.findall(r'\d{8}',hraw)
             hsn=hdigits[0] if hdigits else ''
             # If the narrow crop misses it, search all OCR tokens around the row.
             if not hsn:
@@ -1451,7 +1451,7 @@ def parse_generic_table_image(page_words, text):
                             if m: hsn=m.group(0); break
             # Qty Disc/free is generally the next numeric cell after billed qty;
             # this generic mode leaves it blank when it cannot be read safely.
-            free=num(cell(900,950,cy,True))
+            free=num(cell(700,735,cy,True))
             items.append({'Product Name':product,'Pack':pack,'Manufacturer':mfg,'Batch':batch,
                           'HSN':hsn,'Expiry':exp,'PTR':'','Sale Rate':fmt(sale),'MRP':fmt(mrp),
                           'Billed Qty':fmt(qty),'Free Qty':fmt(free),'Taxable Amount':fmt(base),'GST %':'5'})
