@@ -454,12 +454,47 @@ def parse_leeford_style(text):
     return items
 
 
+
+def parse_yash_style(text):
+    items=[]
+    m=re.search(r"SN\.\s+PRODUCT NAME.*?AMOUNT\s*\n(.*?)(?=GST\s+\d|SUB TOTAL)", text, re.I|re.S)
+    if not m: return items
+    body=m.group(1)
+    chunks=re.split(r"(?m)(?=^\s*\d+\.(?=\s|$))", body)
+    for chunk in chunks:
+        chunk=chunk.strip()
+        if not re.match(r'^\d+\.',chunk): continue
+        lines=[norm(x) for x in chunk.splitlines() if norm(x)]
+        if not lines: continue
+        product=re.sub(r'^\d+\.\s*','',lines[0]).strip()
+        i=1
+        if not product and i<len(lines): product=lines[i]; i+=1
+        manufacturer='ALKEM' if i<len(lines) and lines[i].upper()=='ALKEM' else ''
+        if manufacturer: i+=1
+        hpos=next((k for k in range(i,len(lines)) if re.search(r'\b\d{8}\b',lines[k])),None)
+        if hpos is None: continue
+        hline=lines[hpos]; hm=re.search(r'\b(\d{8})\b\s*(.*)$',hline)
+        hsn=hm.group(1) if hm else ''; pack=hm.group(2).strip() if hm else ''
+        j=hpos+1; batch=''; expiryv=''
+        while j<len(lines):
+            em=re.search(r'\b(\d{1,2}/\d{2})\b',lines[j])
+            if em:
+                expiryv=em.group(1); batch=lines[j][:em.start()].strip() or (lines[j-1] if j-1>hpos else ''); break
+            if not batch: batch=lines[j]
+            j+=1
+        if not expiryv: continue
+        nums=re.findall(r'-?\d+(?:\.\d+)?',' '.join(lines[j+1:]))
+        if len(nums)<9: continue
+        qty,free,mrp,pts,nrate,disc,sgst,cgst,amount=nums[:9]
+        items.append({'Product Name':product,'Pack':pack,'Manufacturer':manufacturer,'Batch':batch,'HSN':hsn,'Expiry':expiryv,'PTR':pts,'Sale Rate':nrate,'MRP':mrp,'Billed Qty':qty,'Free Qty':free,'Taxable Amount':amount,'GST %':'5'})
+    return items
+
 def parse_invoice(text, page_words=None):
     invoice_no = first_match(r"Bill\s+No\.?\s*:\s*([^\n]+)", text)
     if not invoice_no:
         invoice_no = first_match(r"Invoice\s+No\.?\s*[:]?\s*([^\n]+)", text)
 
-    date = first_match(r"\bDATE\s*\n?\s*(\d{2}-\d{2}-\d{4})", text)
+    date = first_match(r"\bDATE\s*:?\s*\n?\s*(\d{2}-\d{2}-\d{4})", text)
     if not date:
         date = first_match(r"Invoice\s+Date\s+(\d{2}-\d{2}-\d{4})", text)
 
@@ -469,8 +504,12 @@ def parse_invoice(text, page_words=None):
 
     eway = first_match(r"E\.Way\s+Bill\s*\n?\s*No\.\s*&\s*Date\s*\n?\s*([0-9]+)", text)
 
-    # Discover the invoice table from the printed column headers first.
-    items = parse_header_driven_table(page_words) if page_words else []
+    # YASH PHARMA has a stable line-oriented MARG layout; parse it before the
+    # generic header detector so serial numbers do not become phantom items.
+    if re.search(r"YASH PHARMA", text, re.I):
+        items = parse_yash_style(text)
+    else:
+        items = parse_header_driven_table(page_words) if page_words else []
 
     # Existing supplier-specific parsers remain as fallbacks.
     if not items and re.search(r"ARJAV PHARMA", text, re.I) and page_words:
@@ -491,9 +530,11 @@ def parse_invoice(text, page_words=None):
             invoice_total = money[-1]
     if not invoice_total:
         invoice_total = first_match(r"TOTAL\s+([\d,]+(?:\.\d+)?)\s*$", text)
+    cgst_total = first_match(r"CGST\s+2\.5\s*%\s*([\d,]+(?:\.\d+)?)", text)
 
     return {"invoice_no": invoice_no, "date": date, "supplier_gstin": supplier_gstin,
-            "eway": eway, "invoice_total": invoice_total, "items": items, "raw_text": text}
+            "eway": eway, "invoice_total": invoice_total, "cgst_total": cgst_total,
+            "items": items, "raw_text": text}
 
 
 def read_template(uploaded):
@@ -534,6 +575,9 @@ def swil_csv(template_rows, meta, items):
             return str(int(round(x)))
         return f"{x:.2f}"
 
+    def money(v):
+        return f"{num(v):.2f}"
+
     def clean_date(v):
         s = str(v or '').strip()
         m = re.fullmatch(r'(\d{2})[-/]?(\d{2})[-/]?(\d{4})', s)
@@ -566,14 +610,16 @@ def swil_csv(template_rows, meta, items):
 
     total = num(meta.get('invoice_total', ''))
     taxable_total = sum(num(x.get('Taxable Amount', '')) for x in items)
-    cgst_total = sum(num(x.get('Taxable Amount', '')) * num(x.get('GST %', '')) / 2 / 100 for x in items)
+    cgst_total = num(meta.get('cgst_total', ''))
+    if not cgst_total:
+        cgst_total = sum(num(x.get('Taxable Amount', '')) * num(x.get('GST %', '')) / 2 / 100 for x in items)
     if not total:
         total = taxable_total + (2 * cgst_total)
 
     # Preserve the proven internal SWIL header string while replacing the
     # invoice-specific total/taxable/CGST values.
     h[33] = (f'N24.00 2.0030 0.00 0   0.00#  0.00R0:0:0          NN1T      '
-             f'0.00NAN  {total:.2f}#Y  0Y  {taxable_total:.2f}  N MZ  '
+             f'0.00NAN  {total:.2f}#Y  {taxable_total:.2f}  N MZ  '
              f'{taxable_total:.2f}   {cgst_total:.2f}      0.00      0.00N     0.00      0.00      0.00')
     h[34] = 'ZYNYNGANNN1N1INN M'; h[35] = 'M '; h[36] = '2'
     h[37] = 'PLOT NO.131/6,S-3,SHOP NO.03,BASMENT AND GROUND MEDICINE COMPLEX NAPIER TOWN'
@@ -596,22 +642,22 @@ def swil_csv(template_rows, meta, items):
         r[12] = fmt(gst)
         r[13] = '0'
         # The proven SWIL file places Sale Rate in column O (index 14), not PTR.
-        r[14] = fmt(item.get('Sale Rate', '') or item.get('PTR', ''))
+        r[14] = money(item.get('Sale Rate', '') or item.get('PTR', ''))
         r[15] = '0.00'
-        r[16] = fmt(item.get('MRP', ''))
+        r[16] = money(item.get('MRP', ''))
         r[18] = '0'
         r[20] = fmt(item.get('Billed Qty', ''))
         r[21] = fmt(item.get('Free Qty', ''))
         r[22] = '0'; r[23] = '0'; r[24] = '0'
-        r[25] = fmt(taxable)
-        r[26] = fmt(cgst)
+        r[25] = money(taxable)
+        r[26] = money(cgst)
         r[27] = '0'; r[28] = '0'; r[29] = 'G'
         # Index 36 = blank; index 37 = MARGID, deliberately blank.
         out.append(r)
 
     # Proven footer shape: total at B, CGST total at J.
     f = [''] * WIDTH
-    f[0] = 'F'; f[1] = fmt(total); f[2] = '0.00'; f[3] = '0'; f[4] = '0'; f[5] = '0'; f[6] = '0'; f[8] = '0'; f[9] = fmt(cgst_total)
+    f[0] = 'F'; f[1] = fmt(total); f[2] = '0.00'; f[3] = '0'; f[4] = '0'; f[5] = '0'; f[6] = '0'; f[8] = '0'; f[9] = money(cgst_total)
     out.append(f)
     return out
 
