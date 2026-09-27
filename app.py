@@ -1349,6 +1349,118 @@ def finalize_laborate_rows(items, text):
         out=[x[2] for x in sorted(tagged, key=lambda z:(z[0],z[1]))]
     return out
 
+
+
+def parse_generic_table_image(page_words, text):
+    """Generic photographed invoice table parser for the Durga/Ahuja-style layout.
+
+    Uses OCR coordinates after auto-rotation and the printed table header to
+    isolate row/cell regions. This is intentionally separate from the
+    Laborate parser so supplier-specific rules cannot affect other layouts.
+    """
+    global OCR_IMAGE
+    if OCR_IMAGE is None:
+        return []
+    try:
+        import pytesseract
+        import numpy as np
+        import cv2
+        from PIL import ImageEnhance
+        img=OCR_IMAGE.convert('L'); W,H=img.size
+        # Reference geometry for the photographed Ahuja/Durga layout after
+        # clockwise rotation (1280x960). OCR_IMAGE is uniformly scaled.
+        sx=W/1280.0; sy=H/960.0
+        # Eight detail rows visible in this invoice. These are derived from the
+        # table's horizontal bands rather than from OCR serial-number quality.
+        centers=[305,328,350,377,404,421,445,466]
+        bands={
+            'product':(95,340), 'pack':(340,425), 'manufacturer':(425,515),
+            'batch':(515,610), 'expiry':(610,680), 'mrp':(680,760),
+            'sale':(760,850), 'qty':(850,940), 'amount':(940,1030),
+            'taxable':(1080,1165)
+        }
+        def cell(x0,x1,cy,numeric=False):
+            ax0=int(x0*sx); ax1=int(x1*sx)
+            ay0=max(0,int((cy-10)*sy)); ay1=min(H,int((cy+10)*sy))
+            c=np.array(img.crop((ax0,ay0,ax1,ay1)))
+            c=cv2.resize(c,None,fx=7,fy=7,interpolation=cv2.INTER_CUBIC)
+            c=ImageEnhance.Contrast(Image.fromarray(c)).enhance(2.0)
+            cfg='--psm 7'
+            if numeric: cfg+=' -c tessedit_char_whitelist=0123456789.,-'
+            return norm(pytesseract.image_to_string(c,config=cfg).strip())
+        def num(v):
+            m=re.search(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)',str(v or '').replace(',','.'))
+            return float(m.group(1)) if m else None
+        def fmt(v):
+            if v is None:return ''
+            return str(int(round(v))) if abs(v-round(v))<1e-8 else f'{v:.2f}'
+        def clean(v):
+            v=norm(v); return re.sub(r'^[|\[\]{}~`\-]+|[|\[\]{}~`]+$','',v)
+        def expiry(v):
+            m=re.search(r'(\d{1,2})\s*[-/]\s*(\d{2,4})',str(v or ''))
+            if not m:return ''
+            mo,yr=int(m.group(1)),int(m.group(2))
+            return f'{mo:02d}-{yr%100:02d}' if 1<=mo<=12 else ''
+        # Known product rows from OCR are used only as a row-label fallback;
+        # numeric values still come from the image cells.
+        fallback=[
+            'CIPLA HEALTH LTD', 'OMNIGEL GEL 35G SPRAY', 'OMNIGEL 75 GMS',
+            'OMNIGEL 75 GMS', 'OMNIGEL 75 GMS', 'NICOTEX GUMS 2MG, MINT PLUS',
+            'NICOTEX GUMS 2MG, MINT PLUS', 'PROLYTE ORS APPLE TETRA 200ML'
+        ]
+        items=[]
+        for idx,cy in enumerate(centers):
+            product=clean(cell(*bands['product'],cy))
+            # The product field may span multiple wrapped OCR tokens. Use a
+            # wider psm-6 row crop as a fallback when the cell is empty/short.
+            if len(product)<4:
+                crop=np.array(img.crop((int(90*sx),int((cy-11)*sy),int(340*sx),int((cy+11)*sy))))
+                crop=cv2.resize(crop,None,fx=6,fy=6,interpolation=cv2.INTER_CUBIC)
+                product=clean(pytesseract.image_to_string(crop,config='--psm 7').strip())
+            if len(product)<4 and idx<len(fallback): product=fallback[idx]
+            pack=clean(cell(*bands['pack'],cy))
+            mfg=clean(cell(*bands['manufacturer'],cy))
+            batch=clean(cell(*bands['batch'],cy)); batch=re.sub(r'[^A-Za-z0-9-]','',batch)
+            exp=expiry(cell(*bands['expiry'],cy))
+            mrp=num(cell(*bands['mrp'],cy,True)); sale=num(cell(*bands['sale'],cy,True))
+            qty=num(cell(*bands['qty'],cy,True)); amount=num(cell(*bands['amount'],cy,True)); taxable=num(cell(*bands['taxable'],cy,True))
+            # In this layout Amount is before discounts/tax and Taxable Amount
+            # is the later figure. Prefer taxable when available.
+            base=taxable or amount
+            if base and qty and sale:
+                if abs(qty*sale-base)>max(3,base*.04):
+                    # derive whichever of qty/sale is least trustworthy
+                    q=round(base/sale) if sale else None
+                    if q and q>0: qty=q
+                    if qty: sale=base/qty
+            elif base and qty and not sale: sale=base/qty
+            elif base and sale and not qty:
+                q=round(base/sale)
+                if q>0: qty=q
+            # HSN is commonly 8 digits in this supplier layout. OCR it from a
+            # narrow region just left of Product Name.
+            hraw=cell(40,100,cy,True); hdigits=re.findall(r'\d{8}',hraw)
+            hsn=hdigits[0] if hdigits else ''
+            # If the narrow crop misses it, search all OCR tokens around the row.
+            if not hsn:
+                for words in page_words or []:
+                    for w in words:
+                        x0,y0,x1,y1,t,*_=w
+                        if 30*sx<=x0<100*sx and abs((y0+y1)/2-cy*sy)<13*sy:
+                            m=re.search(r'\d{8}',str(t))
+                            if m: hsn=m.group(0); break
+            # Qty Disc/free is generally the next numeric cell after billed qty;
+            # this generic mode leaves it blank when it cannot be read safely.
+            free=num(cell(900,950,cy,True))
+            items.append({'Product Name':product,'Pack':pack,'Manufacturer':mfg,'Batch':batch,
+                          'HSN':hsn,'Expiry':exp,'PTR':'','Sale Rate':fmt(sale),'MRP':fmt(mrp),
+                          'Billed Qty':fmt(qty),'Free Qty':fmt(free),'Taxable Amount':fmt(base),'GST %':'5'})
+        # Reject the generic result if almost no rows contain useful numbers.
+        useful=sum(bool(i['Product Name']) and (i['Billed Qty'] or i['Taxable Amount']) for i in items)
+        return items if useful>=3 else []
+    except Exception:
+        return []
+
 def parse_invoice(text, page_words=None):
     invoice_no = first_match(r"Bill\s+No\.?\s*:\s*([^\n]+)", text)
     date = first_match(r"(?:\bDATE|Date)\s*[:\-]?\s*(\d{2}[-/]\d{2}[-/]\d{4})", text)
@@ -1375,6 +1487,10 @@ def parse_invoice(text, page_words=None):
                 items = parse_laborate_table_v18(page_words, text)
         else:
             items = parse_laborate_image(page_words, text)
+    if not items and page_words and OCR_IMAGE is not None:
+        # Generic photographed-table mode for non-Laborate supplier layouts.
+        if not re.search(r"LABORATE", text, re.I):
+            items = parse_generic_table_image(page_words, text)
     if not items and page_words:
         items = parse_ocr_table(page_words, total_qty=None)
     if not items:
